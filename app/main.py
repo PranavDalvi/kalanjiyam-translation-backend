@@ -4,7 +4,12 @@ import sys
 import tempfile
 import threading
 import types
-from typing import Dict, List, Optional, Tuple, Literal
+from typing import Dict, List, Optional, Tuple, Literal, Set
+
+# Force progress bars (like tqdm) to render in non-TTY environments (e.g., Docker logs)
+sys.stderr.isatty = lambda: True
+sys.stdout.isatty = lambda: True
+
 
 import pdfplumber
 import torch
@@ -99,6 +104,7 @@ class TranslationService:
             print(f"Failed to query CUDA devices: {e}. Disabling GPU support.")
             self.available_gpus = []
         self.loaded_models: Dict[Tuple[str, str], Dict[str, object]] = {}
+        self.active_downloads: Set[str] = set()
         self._lock = threading.Lock()
         self._inference_locks: Dict[int, threading.Lock] = {}
         self._inference_locks_lock = threading.Lock()
@@ -156,46 +162,78 @@ class TranslationService:
             # Import lazily so non-translation endpoints can run even if model deps are not ready.
             from IndicTransToolkit.processor import IndicProcessor
 
-            offline_mode = os.environ.get("TRANSFORMERS_OFFLINE", "1") == "1"
-
-            ip = IndicProcessor(inference=True)
-            tokenizer = AutoTokenizer.from_pretrained(
-                model_name,
-                trust_remote_code=True,
-                local_files_only=offline_mode,
-            )
-
-            dtype = torch.float16 if use_cuda else torch.float32
+            self.active_downloads.add(model_name)
             try:
-                model = AutoModelForSeq2SeqLM.from_pretrained(
+                offline_mode = os.environ.get("TRANSFORMERS_OFFLINE", "1") == "1"
+
+                ip = IndicProcessor(inference=True)
+                tokenizer = AutoTokenizer.from_pretrained(
                     model_name,
                     trust_remote_code=True,
-                    torch_dtype=dtype,
                     local_files_only=offline_mode,
-                ).to(device)
-                model.eval()
-            except Exception as e:
-                if use_cuda:
-                    print(f"Failed to load model on GPU: {e}. Retrying CPU fallback.")
-                    device = "cpu"
-                    use_cuda = False
-                    cache_key = (device, model_key)
-                    if cache_key in self.loaded_models:
-                        bundle = self.loaded_models[cache_key]
-                        return bundle["model"], bundle["tokenizer"], bundle["ip"]
+                )
 
+                dtype = torch.float16 if use_cuda else torch.float32
+                try:
                     model = AutoModelForSeq2SeqLM.from_pretrained(
                         model_name,
                         trust_remote_code=True,
-                        torch_dtype=torch.float32,
+                        torch_dtype=dtype,
                         local_files_only=offline_mode,
                     ).to(device)
                     model.eval()
-                else:
-                    raise e
+                except Exception as e:
+                    if use_cuda:
+                        print(f"Failed to load model on GPU: {e}. Retrying CPU fallback.")
+                        device = "cpu"
+                        use_cuda = False
+                        cache_key = (device, model_key)
+                        if cache_key in self.loaded_models:
+                            bundle = self.loaded_models[cache_key]
+                            return bundle["model"], bundle["tokenizer"], bundle["ip"]
+
+                        model = AutoModelForSeq2SeqLM.from_pretrained(
+                            model_name,
+                            trust_remote_code=True,
+                            torch_dtype=torch.float32,
+                            local_files_only=offline_mode,
+                        ).to(device)
+                        model.eval()
+                    else:
+                        raise e
+            finally:
+                self.active_downloads.discard(model_name)
 
             self.loaded_models[cache_key] = {"model": model, "tokenizer": tokenizer, "ip": ip}
             return model, tokenizer, ip
+
+    def _is_model_cached(self, model_name: str) -> bool:
+        hf_home = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+        cache_dir = os.path.join(hf_home, "hub", f"models--{model_name.replace('/', '--')}")
+        if not os.path.exists(cache_dir):
+            return False
+        import glob
+        pattern1 = os.path.join(cache_dir, "**", "model.safetensors")
+        pattern2 = os.path.join(cache_dir, "**", "pytorch_model.bin")
+        files = glob.glob(pattern1, recursive=True) + glob.glob(pattern2, recursive=True)
+        complete_files = [f for f in files if not f.endswith(".incomplete")]
+        return len(complete_files) > 0
+
+    def get_model_status(self, model_name: str, key: str) -> str:
+        # Check if loaded in memory
+        is_loaded = any(k[1] == key for k in self.loaded_models.keys())
+        if is_loaded:
+            return "loaded"
+
+        # Check if active downloading/loading
+        if model_name in self.active_downloads:
+            return "downloading"
+
+        # Check if cached on disk
+        if self._is_model_cached(model_name):
+            return "cached"
+
+        return "not_downloaded"
 
     def available_models(self) -> List[Dict[str, object]]:
         return [
@@ -205,6 +243,7 @@ class TranslationService:
                 "description": meta["description"],
                 "source_languages": meta["source_languages"],
                 "target_languages": meta["target_languages"],
+                "status": self.get_model_status(model_name, meta["key"]),
             }
             for model_name, meta in MODEL_CATALOG.items()
         ]
@@ -328,6 +367,23 @@ service = TranslationService()
 app = FastAPI(title="Kalanjiyam Translation API", version="1.0.0")
 
 
+@app.on_event("startup")
+def preload_models():
+    offline_mode = os.environ.get("TRANSFORMERS_OFFLINE", "1") == "1"
+    if not offline_mode:
+        print("Preloading default translation model (ai4bharat/indictrans2-en-indic-1B) on startup...")
+        try:
+            service.get_translation_model(
+                MODEL_EN_INDIC,
+                "English",
+                "Hindi",
+                0
+            )
+            print("Default model preloaded successfully.")
+        except Exception as e:
+            print(f"Error preloading model during startup: {e}")
+
+
 @app.get("/health")
 def health() -> Dict[str, object]:
     return {
@@ -358,12 +414,26 @@ def translate_text(payload: TranslateTextRequest) -> Dict[str, str]:
     if not src_lang or not tgt_lang:
         raise HTTPException(status_code=400, detail="Invalid source or target language.")
 
-    model, tokenizer, ip = service.get_translation_model(
-        payload.model_name,
-        payload.source_language,
-        payload.target_language,
-        payload.gpu_id,
-    )
+    try:
+        model, tokenizer, ip = service.get_translation_model(
+            payload.model_name,
+            payload.source_language,
+            payload.target_language,
+            payload.gpu_id,
+        )
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        err_msg = str(e)
+        if "offline" in err_msg.lower() or "local_files" in err_msg.lower() or "does not appear to have a file named" in err_msg.lower():
+            raise HTTPException(
+                status_code=503,
+                detail=f"Translation model failed to load. The local cache is likely incomplete or corrupted. Try running './setup_and_run.sh' to download/repair the cache. Error: {err_msg}"
+            )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to load translation model: {err_msg}"
+        )
 
     # Split text by newlines to prevent silent truncation on long texts
     lines = payload.text.split("\n")
@@ -396,7 +466,21 @@ def translate_document(
     if not src_lang or not tgt_lang:
         raise HTTPException(status_code=400, detail="Invalid source or target language.")
 
-    model, tokenizer, ip = service.get_translation_model(model_name, source_language, target_language, gpu_id)
+    try:
+        model, tokenizer, ip = service.get_translation_model(model_name, source_language, target_language, gpu_id)
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        err_msg = str(e)
+        if "offline" in err_msg.lower() or "local_files" in err_msg.lower() or "does not appear to have a file named" in err_msg.lower():
+            raise HTTPException(
+                status_code=503,
+                detail=f"Translation model failed to load. The local cache is likely incomplete or corrupted. Try running './setup_and_run.sh' to download/repair the cache. Error: {err_msg}"
+            )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to load translation model: {err_msg}"
+        )
 
     ext = os.path.splitext(file.filename or "")[1].lower()
     if ext not in {".docx", ".pdf", ".txt"}:
