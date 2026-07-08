@@ -1,0 +1,20 @@
+services:
+  translation-api:
+    build: .
+    container_name: kalanjiyam-translation-api
+    ports:
+      - "8888:8888"
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    environment:
+      - TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-1}
+      - HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
+      - HF_TOKEN=${HF_TOKEN:-}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: always

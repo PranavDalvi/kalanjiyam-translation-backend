@@ -47,6 +47,113 @@ python -m pytest -q tests/test_health.py -k translate_text
 
 Expected result for both commands: all selected tests should pass (for example `4 passed`).
 
+## Docker Setup & Running
+
+You can containerize the service to run with a modern CUDA toolkit independent of the host's CUDA toolkit version, or run it on a CPU-only system.
+
+### Quick Start (Automated Script)
+
+An automated setup and run script `setup_and_run.sh` is provided. This script will:
+1. Build the Docker image.
+2. Check if a GPU is available and whether Docker supports NVIDIA GPU reservations.
+3. Automatically start the container in **GPU mode** (via Docker Compose) if available, or fall back to **CPU mode** (via Docker Run).
+4. Run in online mode to download models on the first translation request if they are not already cached.
+
+To use the script, run:
+```bash
+./setup_and_run.sh
+```
+
+### Manual Steps
+
+#### 1. Build the Docker Image
+
+Build the image locally:
+
+```bash
+docker build -t kalanjiyam-translation .
+```
+
+### 2. Run Tests in Docker
+
+Run the unit tests inside the container (using dummy/mocked models):
+
+```bash
+docker run --rm kalanjiyam-translation python -m pytest -q
+```
+
+### 3. Run Backend API
+
+#### Option A: Running with GPU (via Docker Compose)
+Make sure the **NVIDIA Container Toolkit** is installed on the host. Run:
+
+```bash
+docker compose up -d
+```
+
+This will automatically:
+- Bind port `8888` on the host.
+- Expose all host GPUs to the container.
+- Mount your host's Hugging Face cache `~/.cache/huggingface` inside the container (required for offline mode).
+
+#### Option B: Running on CPU-only Systems
+To run on a CPU-only machine, mount your local Hugging Face cache and start the container without GPU dependencies:
+
+```bash
+docker run -d \
+  -p 8888:8888 \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  --name kalanjiyam-translation-api \
+  kalanjiyam-translation
+```
+
+### 4. Check Container Logs
+
+To monitor the application logs:
+
+- If running via **Docker Compose**:
+  ```bash
+  docker compose logs -f
+  ```
+- If running via **Docker Run**:
+  ```bash
+  docker logs -f kalanjiyam-translation-api
+  ```
+
+### 5. Downloading Models (First-Time Run or Empty Cache)
+
+By default, the service expects models to be already cached locally (`TRANSFORMERS_OFFLINE=1`). If your host's Hugging Face cache (`~/.cache/huggingface`) is empty or missing the IndicTrans2 models, loading will fail.
+
+> [!IMPORTANT]
+> The `ai4bharat/indictrans2` models are **gated** on Hugging Face. To download them:
+> 1. Log into your Hugging Face account and accept the terms of the model repository: [ai4bharat/indictrans2-en-indic-1B](https://huggingface.co/ai4bharat/indictrans2-en-indic-1B).
+> 2. Create a User Access Token (Read permission) under [Hugging Face Settings > Access Tokens](https://huggingface.co/settings/tokens).
+> 3. Provide this token when prompted by `./setup_and_run.sh`, or pass it as the `HF_TOKEN` environment variable in the manual steps below.
+
+To automatically download the models from Hugging Face on the first translation request and save them directly to your host's cache folder (via the volume mount):
+
+- **Via Docker Run**:
+  Pass `TRANSFORMERS_OFFLINE=0` and `HF_HUB_OFFLINE=0` environment variables:
+  ```bash
+  docker run -d \
+    -p 8888:8888 \
+    -v ~/.cache/huggingface:/root/.cache/huggingface \
+    -e TRANSFORMERS_OFFLINE=0 \
+    -e HF_HUB_OFFLINE=0 \
+    --name kalanjiyam-translation-api \
+    kalanjiyam-translation
+  ```
+
+- **Via Docker Compose**:
+  Pass the environment variables inline before starting compose:
+  ```bash
+  TRANSFORMERS_OFFLINE=0 HF_HUB_OFFLINE=0 docker compose up -d
+  ```
+
+*Note: Once the models are downloaded, future restarts of the container can be run in the default offline mode, as the models will persist in your host's `~/.cache/huggingface` directory.*
+
+
+
 ## Available Models
 
 Use `GET /models` to fetch the translation models supported by this API.

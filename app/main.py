@@ -156,11 +156,13 @@ class TranslationService:
             # Import lazily so non-translation endpoints can run even if model deps are not ready.
             from IndicTransToolkit.processor import IndicProcessor
 
+            offline_mode = os.environ.get("TRANSFORMERS_OFFLINE", "1") == "1"
+
             ip = IndicProcessor(inference=True)
             tokenizer = AutoTokenizer.from_pretrained(
                 model_name,
                 trust_remote_code=True,
-                local_files_only=True,
+                local_files_only=offline_mode,
             )
 
             dtype = torch.float16 if use_cuda else torch.float32
@@ -169,7 +171,7 @@ class TranslationService:
                     model_name,
                     trust_remote_code=True,
                     torch_dtype=dtype,
-                    local_files_only=True,
+                    local_files_only=offline_mode,
                 ).to(device)
                 model.eval()
             except Exception as e:
@@ -186,7 +188,7 @@ class TranslationService:
                         model_name,
                         trust_remote_code=True,
                         torch_dtype=torch.float32,
-                        local_files_only=True,
+                        local_files_only=offline_mode,
                     ).to(device)
                     model.eval()
                 else:
