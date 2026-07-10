@@ -26,6 +26,10 @@ COPY mock_modeling_indictrans.py .
 COPY app/ ./app/
 COPY tests/ ./tests/
 
+# Ensure glossaries directory exists inside container
+RUN mkdir -p glossaries
+
+
 # Expose the API port
 EXPOSE 8888
 

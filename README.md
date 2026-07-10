@@ -9,6 +9,7 @@ FastAPI service built from your `translation.py` logic (HF IndicTrans2 models, G
 - `GET /models` for available translation model names and supported directions
 - `POST /translate/text` for text translation
 - `POST /translate/document` for document translation (`.docx`, `.pdf`, `.txt`) returning translated `.docx`
+- `GET /glossaries` to list all available glossaries on the system
 
 ## Setup
 
@@ -216,9 +217,11 @@ Example:
   "source_language": "English",
   "target_language": "Hindi",
   "gpu_id": 0,
-  "batch_size": 8
+  "batch_size": 8,
+  "glossary": "administrative"
 }
 ```
+*(Note: `glossary` is optional. Pass the glossary prefix or name, e.g. `"administrative"`, `"agriculture"`, etc.)*
 
 - Expected output (`200 OK`):
 
@@ -242,6 +245,7 @@ Example:
   - `target_language`: e.g. `Hindi`
   - `gpu_id`: integer (default `0`)
   - `batch_size`: integer (default `8`)
+  - `glossary`: string (optional, e.g. `"administrative"`)
 
 - Expected output (`200 OK`): file download response (`.docx`) with translated content.
 
@@ -250,6 +254,57 @@ Example:
   - `400`: invalid language names
   - `400`: GPU id not available
   - `500`: no GPUs detected
+
+### `GET /glossaries`
+
+- Input: none
+- Expected output (`200 OK`): List of available glossaries on the disk.
+
+Example output:
+```json
+[
+  {
+    "name": "administrative",
+    "source_language_code": "en",
+    "target_language_code": "mr",
+    "filename": "administrative_en_mr.csv"
+  }
+]
+```
+
+## Glossary Support
+
+### 1. Configuration
+Set the path to your glossary CSV files in your `.env` file:
+```env
+GLOSSARIES_DIR=/path/to/your/glossaries/directory
+```
+If using Docker, both direct execution (`setup_and_run.sh`) and Docker Compose dynamically mount this host directory to the container.
+
+### 2. Glossary File Structure & Naming
+- **Naming Pattern**: `[glossary_name]_[src_lang_code]_[tgt_lang_code].csv` (e.g. `administrative_en_mr.csv`).
+- **CSV Format**:
+  ```csv
+  English word,Target translation
+  ```
+  Example:
+  ```csv
+  Wrongful dismissal,चुकीच्या पद्धतीने बाद करणे
+  Yield,उत्पन्न
+  ```
+
+### 3. Glossary Name Aliases
+You can request glossaries using their full names or common abbreviations. The API automatically maps them to short names on disk:
+- `"agriculture"`, `"agriculture"` -> `agri`
+- `"mechanical"`, `"mechanical"` -> `mech`
+- `"biology"`, `"biology"` -> `bio`
+- `"chemistry"`, `"chemistry"` -> `chem`
+- `"computer"`, `"computer science"` -> `comp`
+- `"physics"` -> `phy`
+- `"mathematics"` -> `math`
+- `"information technology"` -> `it`
+
+---
 
 ## Example calls
 

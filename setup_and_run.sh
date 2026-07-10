@@ -104,6 +104,14 @@ else
     echo "---------------------------------------------------------"
 fi
 
+# Ensure GLOSSARIES_DIR is resolved and exists on host
+GLOSSARIES_DIR_VAL="${GLOSSARIES_DIR:-glossaries}"
+GLOSSARIES_HOST_DIR="$GLOSSARIES_DIR_VAL"
+if [[ ! "$GLOSSARIES_HOST_DIR" =~ ^/ ]]; then
+    GLOSSARIES_HOST_DIR="$(pwd)/$GLOSSARIES_HOST_DIR"
+fi
+mkdir -p "$GLOSSARIES_HOST_DIR"
+
 # 6. Start Container
 if [ "$HAS_GPU" = true ]; then
     echo "---------------------------------------------------------"
@@ -114,12 +122,12 @@ if [ "$HAS_GPU" = true ]; then
     # Try using docker compose (v2) or fallback to docker-compose (v1)
     if docker compose version &> /dev/null; then
         docker compose down --remove-orphans || true
-        HF_TOKEN="$HF_TOKEN_ENV" TRANSFORMERS_OFFLINE="$OFFLINE_MODE" HF_HUB_OFFLINE="$OFFLINE_MODE" docker compose up -d
+        GLOSSARIES_DIR="$GLOSSARIES_DIR_VAL" HF_TOKEN="$HF_TOKEN_ENV" TRANSFORMERS_OFFLINE="$OFFLINE_MODE" HF_HUB_OFFLINE="$OFFLINE_MODE" docker compose up -d
         echo "Service is running on http://localhost:8888"
         echo "To view logs, run: docker compose logs -f"
     elif command -v docker-compose &> /dev/null; then
         docker-compose down --remove-orphans || true
-        HF_TOKEN="$HF_TOKEN_ENV" TRANSFORMERS_OFFLINE="$OFFLINE_MODE" HF_HUB_OFFLINE="$OFFLINE_MODE" docker-compose up -d
+        GLOSSARIES_DIR="$GLOSSARIES_DIR_VAL" HF_TOKEN="$HF_TOKEN_ENV" TRANSFORMERS_OFFLINE="$OFFLINE_MODE" HF_HUB_OFFLINE="$OFFLINE_MODE" docker-compose up -d
         echo "Service is running on http://localhost:8888"
         echo "To view logs, run: docker-compose logs -f"
     else
@@ -129,9 +137,11 @@ if [ "$HAS_GPU" = true ]; then
           -p 8888:8888 \
           --gpus all \
           -v ~/.cache/huggingface:/root/.cache/huggingface \
+          -v "$GLOSSARIES_HOST_DIR:/app/glossaries" \
           -e TRANSFORMERS_OFFLINE="$OFFLINE_MODE" \
           -e HF_HUB_OFFLINE="$OFFLINE_MODE" \
           -e HF_TOKEN="$HF_TOKEN_ENV" \
+          -e GLOSSARIES_DIR="glossaries" \
           --name kalanjiyam-translation-api \
           kalanjiyam-translation
         echo "Service is running on http://localhost:8888"
@@ -150,9 +160,11 @@ if [ "$HAS_GPU" = false ]; then
     docker run -d \
       -p 8888:8888 \
       -v ~/.cache/huggingface:/root/.cache/huggingface \
+      -v "$GLOSSARIES_HOST_DIR:/app/glossaries" \
       -e TRANSFORMERS_OFFLINE="$OFFLINE_MODE" \
       -e HF_HUB_OFFLINE="$OFFLINE_MODE" \
       -e HF_TOKEN="$HF_TOKEN_ENV" \
+      -e GLOSSARIES_DIR="glossaries" \
       --name kalanjiyam-translation-api \
       kalanjiyam-translation
       

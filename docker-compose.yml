@@ -6,10 +6,12 @@ services:
       - "8888:8888"
     volumes:
       - ~/.cache/huggingface:/root/.cache/huggingface
+      - ${GLOSSARIES_DIR:-./glossaries}:/app/glossaries
     environment:
       - TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-1}
       - HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
       - HF_TOKEN=${HF_TOKEN:-}
+      - GLOSSARIES_DIR=${GLOSSARIES_DIR:-glossaries}
     deploy:
       resources:
         reservations:

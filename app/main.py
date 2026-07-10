@@ -18,6 +18,9 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile, BackgroundTa
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+from app.glossary import GlossaryService, pre_translate_replace, post_translate_replace
+
+glossary_service = GlossaryService()
 
 # Keep behavior consistent with your original script.
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
@@ -94,6 +97,7 @@ class TranslateTextRequest(BaseModel):
     target_language: str
     gpu_id: int = 0
     batch_size: int = Field(default=8, ge=1, le=64)
+    glossary: Optional[str] = None
 
 
 class TranslationService:
@@ -257,15 +261,28 @@ class TranslationService:
         src_lang: str,
         tgt_lang: str,
         batch_size: int = 8,
+        glossary_dict: Optional[Dict[str, str]] = None,
     ) -> List[str]:
         if not sentences:
             return []
 
+        preprocessed_sentences = []
+        mappings = []
+        if glossary_dict:
+            for s in sentences:
+                proc_s, mapping = pre_translate_replace(s, glossary_dict)
+                preprocessed_sentences.append(proc_s)
+                mappings.append(mapping)
+        else:
+            preprocessed_sentences = sentences
+            mappings = [None] * len(sentences)
+
         all_translations: List[str] = []
-        total_sentences = len(sentences)
+        total_sentences = len(preprocessed_sentences)
 
         for i in range(0, total_sentences, batch_size):
-            batch = sentences[i : i + batch_size]
+            batch = preprocessed_sentences[i : i + batch_size]
+            batch_mappings = mappings[i : i + batch_size]
             valid_indices = [idx for idx, s in enumerate(batch) if s.strip()]
             valid_sentences = [batch[idx] for idx in valid_indices]
 
@@ -298,6 +315,9 @@ class TranslationService:
                 translations = ip.postprocess_batch(translations, lang=tgt_lang)
 
                 for idx, trans in zip(valid_indices, translations):
+                    mapping = batch_mappings[idx]
+                    if mapping:
+                        trans = post_translate_replace(trans, mapping)
                     batch[idx] = trans
 
             all_translations.extend(batch)
@@ -319,6 +339,7 @@ class TranslationService:
         src_lang: str,
         tgt_lang: str,
         batch_size: int,
+        glossary_dict: Optional[Dict[str, str]] = None,
     ) -> Document:
         doc = Document(file_path)
 
@@ -331,6 +352,7 @@ class TranslationService:
             src_lang,
             tgt_lang,
             batch_size=batch_size,
+            glossary_dict=glossary_dict,
         )
 
         for i, paragraph in enumerate(doc.paragraphs):
@@ -354,6 +376,7 @@ class TranslationService:
                             src_lang,
                             tgt_lang,
                             batch_size=1,
+                            glossary_dict=glossary_dict,
                         )[0]
                         cell.text = ""
                         for paragraph in cell.paragraphs:
@@ -406,6 +429,34 @@ def models() -> List[Dict[str, object]]:
     return service.available_models()
 
 
+@app.get("/glossaries")
+def list_glossaries() -> List[Dict[str, str]]:
+    glossaries_dir = glossary_service.get_glossaries_dir()
+    if not os.path.exists(glossaries_dir):
+        return []
+
+    available = []
+    try:
+        for filename in os.listdir(glossaries_dir):
+            if filename.endswith(".csv"):
+                # Pattern is: name_src_tgt.csv
+                parts = filename[:-4].split("_")
+                if len(parts) >= 3:
+                    tgt = parts[-1]
+                    src = parts[-2]
+                    name = "_".join(parts[:-2])
+                    available.append({
+                        "name": name,
+                        "source_language_code": src,
+                        "target_language_code": tgt,
+                        "filename": filename
+                    })
+    except Exception as e:
+        print(f"Error listing glossaries: {e}")
+
+    return available
+
+
 @app.post("/translate/text")
 def translate_text(payload: TranslateTextRequest) -> Dict[str, str]:
     src_lang = LANGUAGES.get(payload.source_language)
@@ -435,6 +486,15 @@ def translate_text(payload: TranslateTextRequest) -> Dict[str, str]:
             detail=f"Failed to load translation model: {err_msg}"
         )
 
+    # Load glossary mapping if requested
+    glossary_dict = None
+    if payload.glossary:
+        glossary_dict = glossary_service.get_glossary_dict(
+            payload.glossary,
+            payload.source_language,
+            payload.target_language
+        )
+
     # Split text by newlines to prevent silent truncation on long texts
     lines = payload.text.split("\n")
     translated_lines = service.translate_batch_memory_safe(
@@ -445,6 +505,7 @@ def translate_text(payload: TranslateTextRequest) -> Dict[str, str]:
         src_lang,
         tgt_lang,
         batch_size=payload.batch_size,
+        glossary_dict=glossary_dict,
     )
 
     return {"text": "\n".join(translated_lines)}
@@ -458,6 +519,7 @@ def translate_document(
     target_language: str = Form(...),
     gpu_id: int = Form(0),
     batch_size: int = Form(8),
+    glossary: Optional[str] = Form(None),
     background_tasks: BackgroundTasks = None,
 ) -> FileResponse:
     src_lang = LANGUAGES.get(source_language)
@@ -482,6 +544,15 @@ def translate_document(
             detail=f"Failed to load translation model: {err_msg}"
         )
 
+    # Load glossary mapping if requested
+    glossary_dict = None
+    if glossary:
+        glossary_dict = glossary_service.get_glossary_dict(
+            glossary,
+            source_language,
+            target_language
+        )
+
     ext = os.path.splitext(file.filename or "")[1].lower()
     if ext not in {".docx", ".pdf", ".txt"}:
         raise HTTPException(status_code=400, detail="Unsupported file type. Use .docx, .pdf, or .txt")
@@ -495,7 +566,7 @@ def translate_document(
             handle.write(content)
 
         if ext == ".docx":
-            doc = service.process_docx(input_path, model, tokenizer, ip, src_lang, tgt_lang, batch_size)
+            doc = service.process_docx(input_path, model, tokenizer, ip, src_lang, tgt_lang, batch_size, glossary_dict)
             doc.save(output_path)
 
         elif ext == ".pdf":
@@ -514,6 +585,7 @@ def translate_document(
                 src_lang,
                 tgt_lang,
                 batch_size=batch_size,
+                glossary_dict=glossary_dict,
             )
             doc = Document()
             for line in translated:
@@ -531,6 +603,7 @@ def translate_document(
                 src_lang,
                 tgt_lang,
                 batch_size=batch_size,
+                glossary_dict=glossary_dict,
             )
             doc = Document()
             for line in translated:
