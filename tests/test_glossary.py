@@ -169,3 +169,76 @@ def test_translate_text_endpoint_with_glossary(monkeypatch) -> None:
     
     assert response.status_code == 200
     assert response.json()["text"] == "त्याला अन्याय करणारा शिक्षा झाली."
+
+
+def test_get_merged_glossary_dict_multiple() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        service = GlossaryService()
+        service.get_glossaries_dir = lambda: temp_dir
+        
+        # Create 2 glossary files
+        with open(os.path.join(temp_dir, "administrative_en_mr.csv"), "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["wrongdoer", "अन्याय करणारा"])
+            writer.writerow(["warning", "इशारा"])
+            
+        with open(os.path.join(temp_dir, "agri_en_mr.csv"), "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["yield", "उत्पन्न"])
+            writer.writerow(["warning", "चेतावणी"])  # Conflict: warning is in both
+            
+        # Test merging list
+        merged = service.get_merged_glossary_dict(["administrative", "agri"], "English", "Marathi")
+        assert merged is not None
+        assert merged["wrongdoer"] == "अन्याय करणारा"
+        assert merged["yield"] == "उत्पन्न"
+        # Conflict resolution: later ('agri') overrides earlier ('administrative')
+        assert merged["warning"] == "चेतावणी"
+
+
+def test_get_merged_glossary_dict_all() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        service = GlossaryService()
+        service.get_glossaries_dir = lambda: temp_dir
+        
+        # Create 2 glossary files for en->mr, and 1 for en->hi (should not be loaded)
+        with open(os.path.join(temp_dir, "administrative_en_mr.csv"), "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["wrongdoer", "अन्याय करणारा"])
+            
+        with open(os.path.join(temp_dir, "agri_en_mr.csv"), "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["yield", "उत्पन्न"])
+            
+        with open(os.path.join(temp_dir, "history_en_hi.csv"), "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["king", "राजा"])
+            
+        # Test 'all' keyword
+        merged = service.get_merged_glossary_dict("all", "English", "Marathi")
+        assert merged is not None
+        assert "wrongdoer" in merged
+        assert "yield" in merged
+        assert "king" not in merged  # different target language
+
+
+def test_get_merged_glossary_dict_comma_separated() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        service = GlossaryService()
+        service.get_glossaries_dir = lambda: temp_dir
+        
+        # Create 2 glossary files
+        with open(os.path.join(temp_dir, "administrative_en_mr.csv"), "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["wrongdoer", "अन्याय करणारा"])
+            
+        with open(os.path.join(temp_dir, "agri_en_mr.csv"), "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["yield", "उत्पन्न"])
+            
+        # Test comma-separated string parameter
+        merged = service.get_merged_glossary_dict("administrative, agri", "English", "Marathi")
+        assert merged is not None
+        assert "wrongdoer" in merged
+        assert "yield" in merged
+

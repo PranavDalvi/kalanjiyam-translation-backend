@@ -4,7 +4,7 @@ import sys
 import tempfile
 import threading
 import types
-from typing import Dict, List, Optional, Tuple, Literal, Set
+from typing import Dict, List, Optional, Tuple, Literal, Set, Union
 
 # Force progress bars (like tqdm) to render in non-TTY environments (e.g., Docker logs)
 sys.stderr.isatty = lambda: True
@@ -97,7 +97,7 @@ class TranslateTextRequest(BaseModel):
     target_language: str
     gpu_id: int = 0
     batch_size: int = Field(default=8, ge=1, le=64)
-    glossary: Optional[str] = None
+    glossary: Optional[Union[str, List[str]]] = None
 
 
 class TranslationService:
@@ -489,7 +489,7 @@ def translate_text(payload: TranslateTextRequest) -> Dict[str, str]:
     # Load glossary mapping if requested
     glossary_dict = None
     if payload.glossary:
-        glossary_dict = glossary_service.get_glossary_dict(
+        glossary_dict = glossary_service.get_merged_glossary_dict(
             payload.glossary,
             payload.source_language,
             payload.target_language
@@ -547,7 +547,7 @@ def translate_document(
     # Load glossary mapping if requested
     glossary_dict = None
     if glossary:
-        glossary_dict = glossary_service.get_glossary_dict(
+        glossary_dict = glossary_service.get_merged_glossary_dict(
             glossary,
             source_language,
             target_language

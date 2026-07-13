@@ -304,6 +304,17 @@ You can request glossaries using their full names or common abbreviations. The A
 - `"mathematics"` -> `math`
 - `"information technology"` -> `it`
 
+### 4. Multi-Glossary Selection & "all" Option
+You can request multiple glossaries or load all matching glossaries:
+- **Formats Supported**:
+  - **Single String**: `"administrative"`
+  - **JSON List**: `["administrative", "agri"]`
+  - **Comma-Separated String**: `"administrative, agri"`
+- **"all" Option**: If you specify `"all"` (e.g. `"all"`, `["all"]`, or `"administrative, all"`), the API dynamically resolves it by loading and merging all available glossary files for the requested source/target language pair on the disk.
+- **Precedence & Collision Resolution**:
+  - Glossaries are merged in the order they are passed (later ones override earlier ones).
+  - For `"all"`, files are loaded and merged in alphabetical order.
+
 ---
 
 ## Example calls

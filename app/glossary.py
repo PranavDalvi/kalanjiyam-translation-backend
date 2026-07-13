@@ -1,7 +1,7 @@
 import csv
 import os
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 # Mapping of application language names to ISO 2-letter codes used in filenames
 LANGUAGE_NAME_TO_ISO: Dict[str, str] = {
@@ -110,6 +110,52 @@ class GlossaryService:
         except Exception as e:
             print(f"Error reading glossary file {filepath}: {e}")
             return None
+
+    def get_merged_glossary_dict(self, glossary_names: Optional[Union[str, List[str]]], src_lang_name: str, tgt_lang_name: str) -> Optional[Dict[str, str]]:
+        if not glossary_names:
+            return None
+
+        # Parse and flatten parameter into list of strings
+        resolved_names: List[str] = []
+        if isinstance(glossary_names, str):
+            resolved_names = [g.strip() for g in glossary_names.split(",") if g.strip()]
+        elif isinstance(glossary_names, list):
+            for item in glossary_names:
+                if isinstance(item, str):
+                    resolved_names.extend([g.strip() for g in item.split(",") if g.strip()])
+
+        if not resolved_names:
+            return None
+
+        # Check if 'all' is requested
+        if any(name.lower() == "all" for name in resolved_names):
+            src_iso = LANGUAGE_NAME_TO_ISO.get(src_lang_name)
+            tgt_iso = LANGUAGE_NAME_TO_ISO.get(tgt_lang_name)
+            if not src_iso or not tgt_iso:
+                return None
+
+            discovered_names = []
+            glossaries_dir = self.get_glossaries_dir()
+            if os.path.exists(glossaries_dir):
+                for filename in os.listdir(glossaries_dir):
+                    if filename.endswith(f"_{src_iso}_{tgt_iso}.csv"):
+                        # Filename pattern: [name]_[src]_[tgt].csv
+                        parts = filename[:-4].split("_")
+                        if len(parts) >= 3:
+                            name = "_".join(parts[:-2])
+                            discovered_names.append(name)
+            
+            # Sort alphabetically for deterministic merge order
+            resolved_names = sorted(list(set(discovered_names)))
+
+        # Merge dictionaries sequentially (later ones overwrite earlier ones)
+        merged_terms: Dict[str, str] = {}
+        for name in resolved_names:
+            terms = self.get_glossary_dict(name, src_lang_name, tgt_lang_name)
+            if terms:
+                merged_terms.update(terms)
+
+        return merged_terms if merged_terms else None
 
 def pre_translate_replace(text: str, glossary_dict: Dict[str, str]) -> Tuple[str, Dict[str, str]]:
     if not glossary_dict:
