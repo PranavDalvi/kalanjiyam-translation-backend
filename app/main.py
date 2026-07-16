@@ -4,7 +4,19 @@ import sys
 import tempfile
 import threading
 import types
+import logging
+import traceback
 from typing import Dict, List, Optional, Tuple, Literal, Set, Union
+
+# Set up logging configuration
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger("translation_backend")
 
 # Force progress bars (like tqdm) to render in non-TTY environments (e.g., Docker logs)
 sys.stderr.isatty = lambda: True
@@ -105,7 +117,7 @@ class TranslationService:
         try:
             self.available_gpus = list(range(torch.cuda.device_count()))
         except Exception as e:
-            print(f"Failed to query CUDA devices: {e}. Disabling GPU support.")
+            logger.exception("Failed to query CUDA devices. Disabling GPU support.")
             self.available_gpus = []
         self.loaded_models: Dict[Tuple[str, str], Dict[str, object]] = {}
         self.active_downloads: Set[str] = set()
@@ -148,9 +160,9 @@ class TranslationService:
                 device = f"cuda:{gpu_id}"
                 use_cuda = True
             except Exception as e:
-                print(f"CUDA initialization failed for GPU {gpu_id} ({e}). Falling back to CPU.")
+                logger.warning(f"CUDA initialization failed for GPU {gpu_id} ({e}). Falling back to CPU.")
         else:
-            print(f"GPU {gpu_id} not available or no CUDA GPUs detected. Falling back to CPU.")
+            logger.info(f"GPU {gpu_id} not available or no CUDA GPUs detected. Falling back to CPU.")
 
         cache_key = (device, model_key)
 
@@ -188,7 +200,7 @@ class TranslationService:
                     model.eval()
                 except Exception as e:
                     if use_cuda:
-                        print(f"Failed to load model on GPU: {e}. Retrying CPU fallback.")
+                        logger.warning(f"Failed to load model on GPU: {e}. Retrying CPU fallback.")
                         device = "cpu"
                         use_cuda = False
                         cache_key = (device, model_key)
@@ -280,53 +292,62 @@ class TranslationService:
         all_translations: List[str] = []
         total_sentences = len(preprocessed_sentences)
 
-        for i in range(0, total_sentences, batch_size):
-            batch = preprocessed_sentences[i : i + batch_size]
-            batch_mappings = mappings[i : i + batch_size]
-            valid_indices = [idx for idx, s in enumerate(batch) if s.strip()]
-            valid_sentences = [batch[idx] for idx in valid_indices]
+        try:
+            for i in range(0, total_sentences, batch_size):
+                batch = preprocessed_sentences[i : i + batch_size]
+                batch_mappings = mappings[i : i + batch_size]
+                valid_indices = [idx for idx, s in enumerate(batch) if s.strip()]
+                valid_sentences = [batch[idx] for idx in valid_indices]
 
-            if valid_sentences:
-                preprocessed = ip.preprocess_batch(valid_sentences, src_lang=src_lang, tgt_lang=tgt_lang)
-                inputs = tokenizer(
-                    preprocessed,
-                    truncation=True,
-                    padding="longest",
-                    return_tensors="pt",
-                )
-
-                lock = self._get_inference_lock(model)
-                with lock:
-                    inputs = inputs.to(model.device)
-                    with torch.no_grad():
-                        generated_tokens = model.generate(
-                            **inputs,
-                            use_cache=True,
-                            min_length=0,
-                            max_length=512,
-                            num_beams=4,
-                            early_stopping=True,
-                        )
-
-                    translations = tokenizer.batch_decode(
-                        generated_tokens.detach().cpu().tolist(),
-                        skip_special_tokens=True,
+                if valid_sentences:
+                    preprocessed = ip.preprocess_batch(valid_sentences, src_lang=src_lang, tgt_lang=tgt_lang)
+                    inputs = tokenizer(
+                        preprocessed,
+                        truncation=True,
+                        padding="longest",
+                        return_tensors="pt",
                     )
-                translations = ip.postprocess_batch(translations, lang=tgt_lang)
 
-                for idx, trans in zip(valid_indices, translations):
-                    mapping = batch_mappings[idx]
-                    if mapping:
-                        trans = post_translate_replace(trans, mapping)
-                    batch[idx] = trans
+                    lock = self._get_inference_lock(model)
+                    with lock:
+                        inputs = inputs.to(model.device)
+                        with torch.no_grad():
+                            generated_tokens = model.generate(
+                                **inputs,
+                                use_cache=True,
+                                min_length=0,
+                                max_length=512,
+                                num_beams=4,
+                                early_stopping=True,
+                            )
 
-            all_translations.extend(batch)
+                        translations = tokenizer.batch_decode(
+                            generated_tokens.detach().cpu().tolist(),
+                            skip_special_tokens=True,
+                        )
+                    translations = ip.postprocess_batch(translations, lang=tgt_lang)
 
-        if model.device.type == "cuda":
-            try:
-                torch.cuda.empty_cache()
-            except Exception:
-                pass
+                    for idx, trans in zip(valid_indices, translations):
+                        mapping = batch_mappings[idx]
+                        if mapping:
+                            trans = post_translate_replace(trans, mapping)
+                        batch[idx] = trans
+
+                all_translations.extend(batch)
+        except Exception as e:
+            logger.exception("Error occurred during batch translation execution:")
+            if model.device.type == "cuda" or torch.cuda.is_available():
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+            raise e
+        finally:
+            if model.device.type == "cuda":
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
 
         return all_translations
 
@@ -389,12 +410,23 @@ class TranslationService:
 service = TranslationService()
 app = FastAPI(title="Kalanjiyam Translation API", version="1.0.0")
 
+from fastapi import Request
+from fastapi.responses import JSONResponse
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.exception(f"Unhandled exception occurred during request to {request.url.path}:")
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"Internal Server Error: {str(exc)}"},
+    )
+
 
 @app.on_event("startup")
 def preload_models():
     offline_mode = os.environ.get("TRANSFORMERS_OFFLINE", "1") == "1"
     if not offline_mode:
-        print("Preloading default translation model (ai4bharat/indictrans2-en-indic-1B) on startup...")
+        logger.info("Preloading default translation model (ai4bharat/indictrans2-en-indic-1B) on startup...")
         try:
             service.get_translation_model(
                 MODEL_EN_INDIC,
@@ -402,9 +434,9 @@ def preload_models():
                 "Hindi",
                 0
             )
-            print("Default model preloaded successfully.")
+            logger.info("Default model preloaded successfully.")
         except Exception as e:
-            print(f"Error preloading model during startup: {e}")
+            logger.exception("Error preloading model during startup:")
 
 
 @app.get("/health")
@@ -452,7 +484,7 @@ def list_glossaries() -> List[Dict[str, str]]:
                         "filename": filename
                     })
     except Exception as e:
-        print(f"Error listing glossaries: {e}")
+        logger.exception("Error listing glossaries:")
 
     return available
 
@@ -497,16 +529,23 @@ def translate_text(payload: TranslateTextRequest) -> Dict[str, str]:
 
     # Split text by newlines to prevent silent truncation on long texts
     lines = payload.text.split("\n")
-    translated_lines = service.translate_batch_memory_safe(
-        lines,
-        model,
-        tokenizer,
-        ip,
-        src_lang,
-        tgt_lang,
-        batch_size=payload.batch_size,
-        glossary_dict=glossary_dict,
-    )
+    try:
+        translated_lines = service.translate_batch_memory_safe(
+            lines,
+            model,
+            tokenizer,
+            ip,
+            src_lang,
+            tgt_lang,
+            batch_size=payload.batch_size,
+            glossary_dict=glossary_dict,
+        )
+    except Exception as e:
+        logger.exception("Text translation endpoint failed:")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Translation processing failed: {str(e)}"
+        )
 
     return {"text": "\n".join(translated_lines)}
 
@@ -557,63 +596,70 @@ def translate_document(
     if ext not in {".docx", ".pdf", ".txt"}:
         raise HTTPException(status_code=400, detail="Unsupported file type. Use .docx, .pdf, or .txt")
 
-    with tempfile.TemporaryDirectory() as temp_dir:
-        input_path = os.path.join(temp_dir, f"input{ext}")
-        output_path = os.path.join(temp_dir, "translated_output.docx")
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_path = os.path.join(temp_dir, f"input{ext}")
+            output_path = os.path.join(temp_dir, "translated_output.docx")
 
-        content = file.file.read()
-        with open(input_path, "wb") as handle:
-            handle.write(content)
+            content = file.file.read()
+            with open(input_path, "wb") as handle:
+                handle.write(content)
 
-        if ext == ".docx":
-            doc = service.process_docx(input_path, model, tokenizer, ip, src_lang, tgt_lang, batch_size, glossary_dict)
-            doc.save(output_path)
+            if ext == ".docx":
+                doc = service.process_docx(input_path, model, tokenizer, ip, src_lang, tgt_lang, batch_size, glossary_dict)
+                doc.save(output_path)
 
-        elif ext == ".pdf":
-            text_list: List[str] = []
-            with pdfplumber.open(io.BytesIO(content)) as pdf:
-                for page in pdf.pages:
-                    page_text = page.extract_text()
-                    if page_text:
-                        text_list.append(page_text)
-            full_text = "\n".join(text_list)
-            translated = service.translate_batch_memory_safe(
-                full_text.split("\n"),
-                model,
-                tokenizer,
-                ip,
-                src_lang,
-                tgt_lang,
-                batch_size=batch_size,
-                glossary_dict=glossary_dict,
-            )
-            doc = Document()
-            for line in translated:
-                doc.add_paragraph(line)
-            doc.save(output_path)
+            elif ext == ".pdf":
+                text_list: List[str] = []
+                with pdfplumber.open(io.BytesIO(content)) as pdf:
+                    for page in pdf.pages:
+                        page_text = page.extract_text()
+                        if page_text:
+                            text_list.append(page_text)
+                full_text = "\n".join(text_list)
+                translated = service.translate_batch_memory_safe(
+                    full_text.split("\n"),
+                    model,
+                    tokenizer,
+                    ip,
+                    src_lang,
+                    tgt_lang,
+                    batch_size=batch_size,
+                    glossary_dict=glossary_dict,
+                )
+                doc = Document()
+                for line in translated:
+                    doc.add_paragraph(line)
+                doc.save(output_path)
 
-        else:  # .txt
-            with open(input_path, "r", encoding="utf-8") as handle:
-                lines = [line.strip() for line in handle.readlines() if line.strip()]
-            translated = service.translate_batch_memory_safe(
-                lines,
-                model,
-                tokenizer,
-                ip,
-                src_lang,
-                tgt_lang,
-                batch_size=batch_size,
-                glossary_dict=glossary_dict,
-            )
-            doc = Document()
-            for line in translated:
-                doc.add_paragraph(line)
-            doc.save(output_path)
+            else:  # .txt
+                with open(input_path, "r", encoding="utf-8") as handle:
+                    lines = [line.strip() for line in handle.readlines() if line.strip()]
+                translated = service.translate_batch_memory_safe(
+                    lines,
+                    model,
+                    tokenizer,
+                    ip,
+                    src_lang,
+                    tgt_lang,
+                    batch_size=batch_size,
+                    glossary_dict=glossary_dict,
+                )
+                doc = Document()
+                for line in translated:
+                    doc.add_paragraph(line)
+                doc.save(output_path)
 
-        final_name = os.path.splitext(file.filename or "document")[0] + f"_translated_{target_language}.docx"
-        persisted_path = os.path.join(os.getcwd(), final_name)
-        with open(output_path, "rb") as src_file, open(persisted_path, "wb") as dst_file:
-            dst_file.write(src_file.read())
+            final_name = os.path.splitext(file.filename or "document")[0] + f"_translated_{target_language}.docx"
+            persisted_path = os.path.join(os.getcwd(), final_name)
+            with open(output_path, "rb") as src_file, open(persisted_path, "wb") as dst_file:
+                dst_file.write(src_file.read())
+    except Exception as e:
+        logger.exception("Document translation endpoint failed:")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Document processing or translation failed: {str(e)}"
+        )
 
     if background_tasks:
         background_tasks.add_task(os.remove, persisted_path)
