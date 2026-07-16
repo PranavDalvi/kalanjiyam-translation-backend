@@ -11,7 +11,7 @@ services:
       - TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-1}
       - HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
       - HF_TOKEN=${HF_TOKEN:-}
-      - GLOSSARIES_DIR=${GLOSSARIES_DIR:-glossaries}
+      - GLOSSARIES_DIR=glossaries
     deploy:
       resources:
         reservations:
