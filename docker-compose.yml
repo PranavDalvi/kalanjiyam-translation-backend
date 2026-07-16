@@ -12,6 +12,8 @@ services:
       - HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
       - HF_TOKEN=${HF_TOKEN:-}
       - GLOSSARIES_DIR=glossaries
+      - MAX_CONCURRENT_TRANSLATIONS=${MAX_CONCURRENT_TRANSLATIONS:-2}
+      - AUTO_SELECT_GPU=${AUTO_SELECT_GPU:-1}
     deploy:
       resources:
         reservations:

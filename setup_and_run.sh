@@ -112,6 +112,9 @@ if [[ ! "$GLOSSARIES_HOST_DIR" =~ ^/ ]]; then
 fi
 mkdir -p "$GLOSSARIES_HOST_DIR"
 
+MAX_CONCURRENT_TRANSLATIONS_VAL="${MAX_CONCURRENT_TRANSLATIONS:-2}"
+AUTO_SELECT_GPU_VAL="${AUTO_SELECT_GPU:-1}"
+
 # 6. Start Container
 if [ "$HAS_GPU" = true ]; then
     echo "---------------------------------------------------------"
@@ -123,13 +126,13 @@ if [ "$HAS_GPU" = true ]; then
     if docker compose version &> /dev/null; then
         docker rm -f kalanjiyam-translation-api 2>/dev/null || true
         docker compose down --remove-orphans || true
-        GLOSSARIES_DIR="$GLOSSARIES_DIR_VAL" HF_TOKEN="$HF_TOKEN_ENV" TRANSFORMERS_OFFLINE="$OFFLINE_MODE" HF_HUB_OFFLINE="$OFFLINE_MODE" docker compose up -d
+        GLOSSARIES_DIR="$GLOSSARIES_DIR_VAL" HF_TOKEN="$HF_TOKEN_ENV" TRANSFORMERS_OFFLINE="$OFFLINE_MODE" HF_HUB_OFFLINE="$OFFLINE_MODE" MAX_CONCURRENT_TRANSLATIONS="$MAX_CONCURRENT_TRANSLATIONS_VAL" AUTO_SELECT_GPU="$AUTO_SELECT_GPU_VAL" docker compose up -d --build
         echo "Service is running on http://localhost:8888"
         echo "To view logs, run: docker compose logs -f"
     elif command -v docker-compose &> /dev/null; then
         docker rm -f kalanjiyam-translation-api 2>/dev/null || true
         docker-compose down --remove-orphans || true
-        GLOSSARIES_DIR="$GLOSSARIES_DIR_VAL" HF_TOKEN="$HF_TOKEN_ENV" TRANSFORMERS_OFFLINE="$OFFLINE_MODE" HF_HUB_OFFLINE="$OFFLINE_MODE" docker-compose up -d
+        GLOSSARIES_DIR="$GLOSSARIES_DIR_VAL" HF_TOKEN="$HF_TOKEN_ENV" TRANSFORMERS_OFFLINE="$OFFLINE_MODE" HF_HUB_OFFLINE="$OFFLINE_MODE" MAX_CONCURRENT_TRANSLATIONS="$MAX_CONCURRENT_TRANSLATIONS_VAL" AUTO_SELECT_GPU="$AUTO_SELECT_GPU_VAL" docker-compose up -d --build
         echo "Service is running on http://localhost:8888"
         echo "To view logs, run: docker-compose logs -f"
     else
@@ -144,6 +147,8 @@ if [ "$HAS_GPU" = true ]; then
           -e HF_HUB_OFFLINE="$OFFLINE_MODE" \
           -e HF_TOKEN="$HF_TOKEN_ENV" \
           -e GLOSSARIES_DIR="glossaries" \
+          -e MAX_CONCURRENT_TRANSLATIONS="$MAX_CONCURRENT_TRANSLATIONS_VAL" \
+          -e AUTO_SELECT_GPU="$AUTO_SELECT_GPU_VAL" \
           --name kalanjiyam-translation-api \
           kalanjiyam-translation
         echo "Service is running on http://localhost:8888"
@@ -167,6 +172,8 @@ if [ "$HAS_GPU" = false ]; then
       -e HF_HUB_OFFLINE="$OFFLINE_MODE" \
       -e HF_TOKEN="$HF_TOKEN_ENV" \
       -e GLOSSARIES_DIR="glossaries" \
+      -e MAX_CONCURRENT_TRANSLATIONS="$MAX_CONCURRENT_TRANSLATIONS_VAL" \
+      -e AUTO_SELECT_GPU="$AUTO_SELECT_GPU_VAL" \
       --name kalanjiyam-translation-api \
       kalanjiyam-translation
       

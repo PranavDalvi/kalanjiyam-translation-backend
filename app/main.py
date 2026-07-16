@@ -149,6 +149,23 @@ class TranslationService:
     ) -> Tuple[AutoModelForSeq2SeqLM, AutoTokenizer, object]:
         model_key, model_name = self._resolve_model(model_name, src_lang_name, tgt_lang_name)
 
+        # Auto-select the GPU with the most free VRAM if enabled and multiple GPUs are available
+        auto_select = os.environ.get("AUTO_SELECT_GPU", "1").lower() not in ("0", "false")
+        if auto_select and len(self.available_gpus) > 1:
+            best_gpu = gpu_id
+            max_free = 0
+            for gid in self.available_gpus:
+                try:
+                    free, total = torch.cuda.mem_get_info(gid)
+                    if free > max_free:
+                        max_free = free
+                        best_gpu = gid
+                except Exception as e:
+                    logger.warning(f"Failed to query memory info for GPU {gid}: {e}")
+            if best_gpu != gpu_id:
+                logger.info(f"Auto-selected GPU {best_gpu} (free VRAM: {max_free / (1024**2):.1f} MiB) over requested GPU {gpu_id}")
+                gpu_id = best_gpu
+
         use_cuda = False
         device = "cpu"
 
@@ -410,6 +427,10 @@ class TranslationService:
 service = TranslationService()
 app = FastAPI(title="Kalanjiyam Translation API", version="1.0.0")
 
+# Concurrency semaphore to throttle concurrent translation executions
+MAX_CONCURRENT_TRANSLATIONS = int(os.environ.get("MAX_CONCURRENT_TRANSLATIONS", 2))
+translation_semaphore = threading.Semaphore(MAX_CONCURRENT_TRANSLATIONS)
+
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
@@ -497,55 +518,56 @@ def translate_text(payload: TranslateTextRequest) -> Dict[str, str]:
     if not src_lang or not tgt_lang:
         raise HTTPException(status_code=400, detail="Invalid source or target language.")
 
-    try:
-        model, tokenizer, ip = service.get_translation_model(
-            payload.model_name,
-            payload.source_language,
-            payload.target_language,
-            payload.gpu_id,
-        )
-    except HTTPException as he:
-        raise he
-    except Exception as e:
-        err_msg = str(e)
-        if "offline" in err_msg.lower() or "local_files" in err_msg.lower() or "does not appear to have a file named" in err_msg.lower():
-            raise HTTPException(
-                status_code=503,
-                detail=f"Translation model failed to load. The local cache is likely incomplete or corrupted. Try running './setup_and_run.sh' to download/repair the cache. Error: {err_msg}"
+    with translation_semaphore:
+        try:
+            model, tokenizer, ip = service.get_translation_model(
+                payload.model_name,
+                payload.source_language,
+                payload.target_language,
+                payload.gpu_id,
             )
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to load translation model: {err_msg}"
-        )
+        except HTTPException as he:
+            raise he
+        except Exception as e:
+            err_msg = str(e)
+            if "offline" in err_msg.lower() or "local_files" in err_msg.lower() or "does not appear to have a file named" in err_msg.lower():
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Translation model failed to load. The local cache is likely incomplete or corrupted. Try running './setup_and_run.sh' to download/repair the cache. Error: {err_msg}"
+                )
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to load translation model: {err_msg}"
+            )
 
-    # Load glossary mapping if requested
-    glossary_dict = None
-    if payload.glossary:
-        glossary_dict = glossary_service.get_merged_glossary_dict(
-            payload.glossary,
-            payload.source_language,
-            payload.target_language
-        )
+        # Load glossary mapping if requested
+        glossary_dict = None
+        if payload.glossary:
+            glossary_dict = glossary_service.get_merged_glossary_dict(
+                payload.glossary,
+                payload.source_language,
+                payload.target_language
+            )
 
-    # Split text by newlines to prevent silent truncation on long texts
-    lines = payload.text.split("\n")
-    try:
-        translated_lines = service.translate_batch_memory_safe(
-            lines,
-            model,
-            tokenizer,
-            ip,
-            src_lang,
-            tgt_lang,
-            batch_size=payload.batch_size,
-            glossary_dict=glossary_dict,
-        )
-    except Exception as e:
-        logger.exception("Text translation endpoint failed:")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Translation processing failed: {str(e)}"
-        )
+        # Split text by newlines to prevent silent truncation on long texts
+        lines = payload.text.split("\n")
+        try:
+            translated_lines = service.translate_batch_memory_safe(
+                lines,
+                model,
+                tokenizer,
+                ip,
+                src_lang,
+                tgt_lang,
+                batch_size=payload.batch_size,
+                glossary_dict=glossary_dict,
+            )
+        except Exception as e:
+            logger.exception("Text translation endpoint failed:")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Translation processing failed: {str(e)}"
+            )
 
     return {"text": "\n".join(translated_lines)}
 
@@ -567,99 +589,100 @@ def translate_document(
     if not src_lang or not tgt_lang:
         raise HTTPException(status_code=400, detail="Invalid source or target language.")
 
-    try:
-        model, tokenizer, ip = service.get_translation_model(model_name, source_language, target_language, gpu_id)
-    except HTTPException as he:
-        raise he
-    except Exception as e:
-        err_msg = str(e)
-        if "offline" in err_msg.lower() or "local_files" in err_msg.lower() or "does not appear to have a file named" in err_msg.lower():
+    with translation_semaphore:
+        try:
+            model, tokenizer, ip = service.get_translation_model(model_name, source_language, target_language, gpu_id)
+        except HTTPException as he:
+            raise he
+        except Exception as e:
+            err_msg = str(e)
+            if "offline" in err_msg.lower() or "local_files" in err_msg.lower() or "does not appear to have a file named" in err_msg.lower():
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Translation model failed to load. The local cache is likely incomplete or corrupted. Try running './setup_and_run.sh' to download/repair the cache. Error: {err_msg}"
+                )
             raise HTTPException(
-                status_code=503,
-                detail=f"Translation model failed to load. The local cache is likely incomplete or corrupted. Try running './setup_and_run.sh' to download/repair the cache. Error: {err_msg}"
+                status_code=500,
+                detail=f"Failed to load translation model: {err_msg}"
             )
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to load translation model: {err_msg}"
-        )
 
-    # Load glossary mapping if requested
-    glossary_dict = None
-    if glossary:
-        glossary_dict = glossary_service.get_merged_glossary_dict(
-            glossary,
-            source_language,
-            target_language
-        )
+        # Load glossary mapping if requested
+        glossary_dict = None
+        if glossary:
+            glossary_dict = glossary_service.get_merged_glossary_dict(
+                glossary,
+                source_language,
+                target_language
+            )
 
-    ext = os.path.splitext(file.filename or "")[1].lower()
-    if ext not in {".docx", ".pdf", ".txt"}:
-        raise HTTPException(status_code=400, detail="Unsupported file type. Use .docx, .pdf, or .txt")
+        ext = os.path.splitext(file.filename or "")[1].lower()
+        if ext not in {".docx", ".pdf", ".txt"}:
+            raise HTTPException(status_code=400, detail="Unsupported file type. Use .docx, .pdf, or .txt")
 
-    try:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            input_path = os.path.join(temp_dir, f"input{ext}")
-            output_path = os.path.join(temp_dir, "translated_output.docx")
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                input_path = os.path.join(temp_dir, f"input{ext}")
+                output_path = os.path.join(temp_dir, "translated_output.docx")
 
-            content = file.file.read()
-            with open(input_path, "wb") as handle:
-                handle.write(content)
+                content = file.file.read()
+                with open(input_path, "wb") as handle:
+                    handle.write(content)
 
-            if ext == ".docx":
-                doc = service.process_docx(input_path, model, tokenizer, ip, src_lang, tgt_lang, batch_size, glossary_dict)
-                doc.save(output_path)
+                if ext == ".docx":
+                    doc = service.process_docx(input_path, model, tokenizer, ip, src_lang, tgt_lang, batch_size, glossary_dict)
+                    doc.save(output_path)
 
-            elif ext == ".pdf":
-                text_list: List[str] = []
-                with pdfplumber.open(io.BytesIO(content)) as pdf:
-                    for page in pdf.pages:
-                        page_text = page.extract_text()
-                        if page_text:
-                            text_list.append(page_text)
-                full_text = "\n".join(text_list)
-                translated = service.translate_batch_memory_safe(
-                    full_text.split("\n"),
-                    model,
-                    tokenizer,
-                    ip,
-                    src_lang,
-                    tgt_lang,
-                    batch_size=batch_size,
-                    glossary_dict=glossary_dict,
-                )
-                doc = Document()
-                for line in translated:
-                    doc.add_paragraph(line)
-                doc.save(output_path)
+                elif ext == ".pdf":
+                    text_list: List[str] = []
+                    with pdfplumber.open(io.BytesIO(content)) as pdf:
+                        for page in pdf.pages:
+                            page_text = page.extract_text()
+                            if page_text:
+                                text_list.append(page_text)
+                    full_text = "\n".join(text_list)
+                    translated = service.translate_batch_memory_safe(
+                        full_text.split("\n"),
+                        model,
+                        tokenizer,
+                        ip,
+                        src_lang,
+                        tgt_lang,
+                        batch_size=batch_size,
+                        glossary_dict=glossary_dict,
+                    )
+                    doc = Document()
+                    for line in translated:
+                        doc.add_paragraph(line)
+                    doc.save(output_path)
 
-            else:  # .txt
-                with open(input_path, "r", encoding="utf-8") as handle:
-                    lines = [line.strip() for line in handle.readlines() if line.strip()]
-                translated = service.translate_batch_memory_safe(
-                    lines,
-                    model,
-                    tokenizer,
-                    ip,
-                    src_lang,
-                    tgt_lang,
-                    batch_size=batch_size,
-                    glossary_dict=glossary_dict,
-                )
-                doc = Document()
-                for line in translated:
-                    doc.add_paragraph(line)
-                doc.save(output_path)
+                else:  # .txt
+                    with open(input_path, "r", encoding="utf-8") as handle:
+                        lines = [line.strip() for line in handle.readlines() if line.strip()]
+                    translated = service.translate_batch_memory_safe(
+                        lines,
+                        model,
+                        tokenizer,
+                        ip,
+                        src_lang,
+                        tgt_lang,
+                        batch_size=batch_size,
+                        glossary_dict=glossary_dict,
+                    )
+                    doc = Document()
+                    for line in translated:
+                        doc.add_paragraph(line)
+                    doc.save(output_path)
 
-            final_name = os.path.splitext(file.filename or "document")[0] + f"_translated_{target_language}.docx"
-            persisted_path = os.path.join(os.getcwd(), final_name)
-            with open(output_path, "rb") as src_file, open(persisted_path, "wb") as dst_file:
-                dst_file.write(src_file.read())
-    except Exception as e:
-        logger.exception("Document translation endpoint failed:")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Document processing or translation failed: {str(e)}"
-        )
+                final_name = os.path.splitext(file.filename or "document")[0] + f"_translated_{target_language}.docx"
+                persisted_path = os.path.join(os.getcwd(), final_name)
+                with open(output_path, "rb") as src_file, open(persisted_path, "wb") as dst_file:
+                    dst_file.write(src_file.read())
+        except Exception as e:
+            logger.exception("Document translation endpoint failed:")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Document processing or translation failed: {str(e)}"
+            )
 
     if background_tasks:
         background_tasks.add_task(os.remove, persisted_path)
