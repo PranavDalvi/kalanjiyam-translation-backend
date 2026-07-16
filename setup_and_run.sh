@@ -35,8 +35,8 @@ HAS_GPU=false
 if command -v nvidia-smi &> /dev/null; then
     # Test if nvidia-smi runs successfully and communicates with driver
     if nvidia-smi &> /dev/null; then
-        # Check if docker runtime has GPU capabilities
-        if docker run --help | grep -q "--gpus"; then
+        # Check if docker runtime has GPU capabilities or nvidia runtime registered
+        if docker run --help 2>/dev/null | grep -q "--gpus" || docker info 2>/dev/null | grep -iq "nvidia"; then
             HAS_GPU=true
         fi
     fi
@@ -121,11 +121,13 @@ if [ "$HAS_GPU" = true ]; then
     
     # Try using docker compose (v2) or fallback to docker-compose (v1)
     if docker compose version &> /dev/null; then
+        docker rm -f kalanjiyam-translation-api 2>/dev/null || true
         docker compose down --remove-orphans || true
         GLOSSARIES_DIR="$GLOSSARIES_DIR_VAL" HF_TOKEN="$HF_TOKEN_ENV" TRANSFORMERS_OFFLINE="$OFFLINE_MODE" HF_HUB_OFFLINE="$OFFLINE_MODE" docker compose up -d
         echo "Service is running on http://localhost:8888"
         echo "To view logs, run: docker compose logs -f"
     elif command -v docker-compose &> /dev/null; then
+        docker rm -f kalanjiyam-translation-api 2>/dev/null || true
         docker-compose down --remove-orphans || true
         GLOSSARIES_DIR="$GLOSSARIES_DIR_VAL" HF_TOKEN="$HF_TOKEN_ENV" TRANSFORMERS_OFFLINE="$OFFLINE_MODE" HF_HUB_OFFLINE="$OFFLINE_MODE" docker-compose up -d
         echo "Service is running on http://localhost:8888"
