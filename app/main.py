@@ -3,6 +3,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import types
 import logging
 import traceback
@@ -120,10 +121,35 @@ class TranslationService:
             logger.exception("Failed to query CUDA devices. Disabling GPU support.")
             self.available_gpus = []
         self.loaded_models: Dict[Tuple[str, str], Dict[str, object]] = {}
+        self.last_used: Dict[Tuple[str, str], float] = {}
         self.active_downloads: Set[str] = set()
         self._lock = threading.Lock()
         self._inference_locks: Dict[int, threading.Lock] = {}
         self._inference_locks_lock = threading.Lock()
+
+    def unload_idle_models(self, idle_timeout_seconds: float) -> None:
+        now = time.time()
+        unloaded_any = False
+        with self._lock:
+            keys_to_unload = [
+                key for key, last_time in self.last_used.items()
+                if now - last_time > idle_timeout_seconds
+            ]
+            for key in keys_to_unload:
+                logger.info(f"Auto-unloading idle model: device={key[0]}, model_key={key[1]}")
+                bundle = self.loaded_models.pop(key, None)
+                self.last_used.pop(key, None)
+                if bundle:
+                    del bundle["model"]
+                    del bundle["tokenizer"]
+                    del bundle["ip"]
+                    unloaded_any = True
+
+        if unloaded_any:
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     def _get_inference_lock(self, model: object) -> threading.Lock:
         model_id = id(model)
@@ -171,6 +197,8 @@ class TranslationService:
 
         if self.available_gpus and gpu_id in self.available_gpus:
             try:
+                # Set active device context for this thread
+                torch.cuda.set_device(gpu_id)
                 # Test CUDA initialization
                 test_tensor = torch.zeros(1).to(f"cuda:{gpu_id}")
                 del test_tensor
@@ -185,11 +213,13 @@ class TranslationService:
 
         if cache_key in self.loaded_models:
             bundle = self.loaded_models[cache_key]
+            self.last_used[cache_key] = time.time()
             return bundle["model"], bundle["tokenizer"], bundle["ip"]
 
         with self._lock:
             if cache_key in self.loaded_models:
                 bundle = self.loaded_models[cache_key]
+                self.last_used[cache_key] = time.time()
                 return bundle["model"], bundle["tokenizer"], bundle["ip"]
 
             # Import lazily so non-translation endpoints can run even if model deps are not ready.
@@ -208,6 +238,8 @@ class TranslationService:
 
                 dtype = torch.float16 if use_cuda else torch.float32
                 try:
+                    if use_cuda:
+                        torch.cuda.set_device(gpu_id)
                     model = AutoModelForSeq2SeqLM.from_pretrained(
                         model_name,
                         trust_remote_code=True,
@@ -223,6 +255,7 @@ class TranslationService:
                         cache_key = (device, model_key)
                         if cache_key in self.loaded_models:
                             bundle = self.loaded_models[cache_key]
+                            self.last_used[cache_key] = time.time()
                             return bundle["model"], bundle["tokenizer"], bundle["ip"]
 
                         model = AutoModelForSeq2SeqLM.from_pretrained(
@@ -238,6 +271,7 @@ class TranslationService:
                 self.active_downloads.discard(model_name)
 
             self.loaded_models[cache_key] = {"model": model, "tokenizer": tokenizer, "ip": ip}
+            self.last_used[cache_key] = time.time()
             return model, tokenizer, ip
 
     def _is_model_cached(self, model_name: str) -> bool:
@@ -327,6 +361,8 @@ class TranslationService:
 
                     lock = self._get_inference_lock(model)
                     with lock:
+                        if model.device.type == "cuda":
+                            torch.cuda.set_device(model.device)
                         inputs = inputs.to(model.device)
                         with torch.no_grad():
                             generated_tokens = model.generate(
@@ -443,8 +479,24 @@ async def global_exception_handler(request: Request, exc: Exception):
     )
 
 
+def start_model_cleanup_worker():
+    def cleanup_loop():
+        idle_timeout = float(os.environ.get("MODEL_IDLE_TIMEOUT", "1800"))
+        logger.info(f"Starting background translation model cleanup worker (idle_timeout={idle_timeout}s)")
+        while True:
+            try:
+                time.sleep(60)
+                service.unload_idle_models(idle_timeout)
+            except Exception as e:
+                logger.error(f"Error in model cleanup worker: {e}")
+
+    t = threading.Thread(target=cleanup_loop, daemon=True)
+    t.start()
+
+
 @app.on_event("startup")
 def preload_models():
+    start_model_cleanup_worker()
     offline_mode = os.environ.get("TRANSFORMERS_OFFLINE", "1") == "1"
     if not offline_mode:
         logger.info("Preloading default translation model (ai4bharat/indictrans2-en-indic-1B) on startup...")
