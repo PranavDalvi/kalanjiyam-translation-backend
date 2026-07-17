@@ -26,6 +26,7 @@ sys.stdout.isatty = lambda: True
 
 import pdfplumber
 import torch
+torch.set_num_threads(1)
 from docx import Document
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, BackgroundTasks
 from fastapi.responses import FileResponse
@@ -175,52 +176,46 @@ class TranslationService:
     ) -> Tuple[AutoModelForSeq2SeqLM, AutoTokenizer, object]:
         model_key, model_name = self._resolve_model(model_name, src_lang_name, tgt_lang_name)
 
-        # Auto-select the GPU with the most free VRAM if enabled and multiple GPUs are available
-        auto_select = os.environ.get("AUTO_SELECT_GPU", "1").lower() not in ("0", "false")
-        if auto_select and len(self.available_gpus) > 1:
-            best_gpu = gpu_id
-            max_free = 0
-            for gid in self.available_gpus:
-                try:
-                    free, total = torch.cuda.mem_get_info(gid)
-                    if free > max_free:
-                        max_free = free
-                        best_gpu = gid
-                except Exception as e:
-                    logger.warning(f"Failed to query memory info for GPU {gid}: {e}")
-            if best_gpu != gpu_id:
-                logger.info(f"Auto-selected GPU {best_gpu} (free VRAM: {max_free / (1024**2):.1f} MiB) over requested GPU {gpu_id}")
-                gpu_id = best_gpu
-
-        use_cuda = False
-        device = "cpu"
-
-        if self.available_gpus and gpu_id in self.available_gpus:
-            try:
-                # Set active device context for this thread
-                torch.cuda.set_device(gpu_id)
-                # Test CUDA initialization
-                test_tensor = torch.zeros(1).to(f"cuda:{gpu_id}")
-                del test_tensor
-                device = f"cuda:{gpu_id}"
-                use_cuda = True
-            except Exception as e:
-                logger.warning(f"CUDA initialization failed for GPU {gpu_id} ({e}). Falling back to CPU.")
-        else:
-            logger.info(f"GPU {gpu_id} not available or no CUDA GPUs detected. Falling back to CPU.")
-
-        cache_key = (device, model_key)
-
-        if cache_key in self.loaded_models:
-            bundle = self.loaded_models[cache_key]
-            self.last_used[cache_key] = time.time()
-            return bundle["model"], bundle["tokenizer"], bundle["ip"]
-
+        # 1. Quick check if already loaded on any device to reuse it and avoid concurrent VRAM checks
         with self._lock:
-            if cache_key in self.loaded_models:
-                bundle = self.loaded_models[cache_key]
-                self.last_used[cache_key] = time.time()
-                return bundle["model"], bundle["tokenizer"], bundle["ip"]
+            for key, bundle in self.loaded_models.items():
+                if key[1] == model_key:
+                    self.last_used[key] = time.time()
+                    return bundle["model"], bundle["tokenizer"], bundle["ip"]
+
+            # 2. Select GPU under the lock if not loaded
+            auto_select = os.environ.get("AUTO_SELECT_GPU", "1").lower() not in ("0", "false")
+            if auto_select and len(self.available_gpus) > 1:
+                best_gpu = gpu_id
+                max_free = 0
+                for gid in self.available_gpus:
+                    try:
+                        free, total = torch.cuda.mem_get_info(gid)
+                        if free > max_free:
+                            max_free = free
+                            best_gpu = gid
+                    except Exception as e:
+                        logger.warning(f"Failed to query memory info for GPU {gid}: {e}")
+                if best_gpu != gpu_id:
+                    logger.info(f"Auto-selected GPU {best_gpu} (free VRAM: {max_free / (1024**2):.1f} MiB) over requested GPU {gpu_id}")
+                    gpu_id = best_gpu
+
+            use_cuda = False
+            device = "cpu"
+
+            if self.available_gpus and gpu_id in self.available_gpus:
+                try:
+                    torch.cuda.set_device(gpu_id)
+                    test_tensor = torch.zeros(1).to(f"cuda:{gpu_id}")
+                    del test_tensor
+                    device = f"cuda:{gpu_id}"
+                    use_cuda = True
+                except Exception as e:
+                    logger.warning(f"CUDA initialization failed for GPU {gpu_id} ({e}). Falling back to CPU.")
+            else:
+                logger.info(f"GPU {gpu_id} not available or no CUDA GPUs detected. Falling back to CPU.")
+
+            cache_key = (device, model_key)
 
             # Import lazily so non-translation endpoints can run even if model deps are not ready.
             from IndicTransToolkit.processor import IndicProcessor
@@ -351,18 +346,18 @@ class TranslationService:
                 valid_sentences = [batch[idx] for idx in valid_indices]
 
                 if valid_sentences:
-                    preprocessed = ip.preprocess_batch(valid_sentences, src_lang=src_lang, tgt_lang=tgt_lang)
-                    inputs = tokenizer(
-                        preprocessed,
-                        truncation=True,
-                        padding="longest",
-                        return_tensors="pt",
-                    )
-
                     lock = self._get_inference_lock(model)
                     with lock:
                         if model.device.type == "cuda":
                             torch.cuda.set_device(model.device)
+                        
+                        preprocessed = ip.preprocess_batch(valid_sentences, src_lang=src_lang, tgt_lang=tgt_lang)
+                        inputs = tokenizer(
+                            preprocessed,
+                            truncation=True,
+                            padding="longest",
+                            return_tensors="pt",
+                        )
                         inputs = inputs.to(model.device)
                         with torch.no_grad():
                             generated_tokens = model.generate(
@@ -378,7 +373,7 @@ class TranslationService:
                             generated_tokens.detach().cpu().tolist(),
                             skip_special_tokens=True,
                         )
-                    translations = ip.postprocess_batch(translations, lang=tgt_lang)
+                        translations = ip.postprocess_batch(translations, lang=tgt_lang)
 
                     for idx, trans in zip(valid_indices, translations):
                         mapping = batch_mappings[idx]
@@ -564,6 +559,11 @@ def list_glossaries() -> List[Dict[str, str]]:
 
 @app.post("/translate/text")
 def translate_text(payload: TranslateTextRequest) -> Dict[str, str]:
+    logger.info(
+        f"Incoming Text Request: source_lang={payload.source_language}, "
+        f"target_lang={payload.target_language}, model_name={payload.model_name}, "
+        f"text_length={len(payload.text)} chars"
+    )
     src_lang = LANGUAGES.get(payload.source_language)
     tgt_lang = LANGUAGES.get(payload.target_language)
 
@@ -621,7 +621,11 @@ def translate_text(payload: TranslateTextRequest) -> Dict[str, str]:
                 detail=f"Translation processing failed: {str(e)}"
             )
 
-    return {"text": "\n".join(translated_lines)}
+    translated_text = "\n".join(translated_lines)
+    logger.info(
+        f"Outgoing Text Response: text_length={len(translated_text)} chars"
+    )
+    return {"text": translated_text}
 
 
 @app.post("/translate/document")
@@ -635,6 +639,11 @@ def translate_document(
     glossary: Optional[str] = Form(None),
     background_tasks: BackgroundTasks = None,
 ) -> FileResponse:
+    logger.info(
+        f"Incoming Document Request: filename={file.filename}, "
+        f"source_lang={source_language}, target_lang={target_language}, "
+        f"model_name={model_name}"
+    )
     src_lang = LANGUAGES.get(source_language)
     tgt_lang = LANGUAGES.get(target_language)
 
@@ -739,6 +748,7 @@ def translate_document(
     if background_tasks:
         background_tasks.add_task(os.remove, persisted_path)
 
+    logger.info(f"Outgoing Document Response: final_filename={final_name}")
     return FileResponse(
         path=persisted_path,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
