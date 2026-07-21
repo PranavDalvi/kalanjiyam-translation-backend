@@ -28,11 +28,12 @@ import pdfplumber
 import torch
 torch.set_num_threads(1)
 from docx import Document
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, BackgroundTasks
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, BackgroundTasks, Depends
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 from app.glossary import GlossaryService, pre_translate_replace, post_translate_replace
+from app.api_key import verify_api_key_dependency
 
 glossary_service = GlossaryService()
 
@@ -557,7 +558,7 @@ def list_glossaries() -> List[Dict[str, str]]:
     return available
 
 
-@app.post("/translate/text")
+@app.post("/translate/text", dependencies=[Depends(verify_api_key_dependency)])
 def translate_text(payload: TranslateTextRequest) -> Dict[str, str]:
     logger.info(
         f"Incoming Text Request: source_lang={payload.source_language}, "
@@ -628,7 +629,7 @@ def translate_text(payload: TranslateTextRequest) -> Dict[str, str]:
     return {"text": translated_text}
 
 
-@app.post("/translate/document")
+@app.post("/translate/document", dependencies=[Depends(verify_api_key_dependency)])
 def translate_document(
     file: UploadFile = File(...),
     model_name: str = Form(...),

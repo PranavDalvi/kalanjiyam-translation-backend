@@ -114,6 +114,12 @@ mkdir -p "$GLOSSARIES_HOST_DIR"
 
 MAX_CONCURRENT_TRANSLATIONS_VAL="${MAX_CONCURRENT_TRANSLATIONS:-2}"
 AUTO_SELECT_GPU_VAL="${AUTO_SELECT_GPU:-1}"
+ENABLE_API_KEY_AUTH_VAL="${ENABLE_API_KEY_AUTH:-0}"
+API_KEY_DB_PATH_VAL="${API_KEY_DB_PATH:-api_keys.db}"
+
+# Ensure API key DB file exists on host so Docker can volume mount it
+touch "$API_KEY_DB_PATH_VAL"
+API_KEY_DB_ABS_PATH=$(readlink -f "$API_KEY_DB_PATH_VAL")
 
 # 6. Start Container
 if [ "$HAS_GPU" = true ]; then
@@ -126,13 +132,14 @@ if [ "$HAS_GPU" = true ]; then
     if docker compose version &> /dev/null; then
         docker rm -f kalanjiyam-translation-api 2>/dev/null || true
         docker compose down --remove-orphans || true
-        GLOSSARIES_DIR="$GLOSSARIES_DIR_VAL" HF_TOKEN="$HF_TOKEN_ENV" TRANSFORMERS_OFFLINE="$OFFLINE_MODE" HF_HUB_OFFLINE="$OFFLINE_MODE" MAX_CONCURRENT_TRANSLATIONS="$MAX_CONCURRENT_TRANSLATIONS_VAL" AUTO_SELECT_GPU="$AUTO_SELECT_GPU_VAL" docker compose up -d --build
+        GLOSSARIES_DIR="$GLOSSARIES_DIR_VAL" HF_TOKEN="$HF_TOKEN_ENV" TRANSFORMERS_OFFLINE="$OFFLINE_MODE" HF_HUB_OFFLINE="$OFFLINE_MODE" MAX_CONCURRENT_TRANSLATIONS="$MAX_CONCURRENT_TRANSLATIONS_VAL" AUTO_SELECT_GPU="$AUTO_SELECT_GPU_VAL" ENABLE_API_KEY_AUTH="$ENABLE_API_KEY_AUTH_VAL" API_KEY_DB_PATH="api_keys.db" docker compose up -d --build
         echo "Service is running on http://localhost:8888"
         echo "To view logs, run: docker compose logs -f"
+
     elif command -v docker-compose &> /dev/null; then
         docker rm -f kalanjiyam-translation-api 2>/dev/null || true
         docker-compose down --remove-orphans || true
-        GLOSSARIES_DIR="$GLOSSARIES_DIR_VAL" HF_TOKEN="$HF_TOKEN_ENV" TRANSFORMERS_OFFLINE="$OFFLINE_MODE" HF_HUB_OFFLINE="$OFFLINE_MODE" MAX_CONCURRENT_TRANSLATIONS="$MAX_CONCURRENT_TRANSLATIONS_VAL" AUTO_SELECT_GPU="$AUTO_SELECT_GPU_VAL" docker-compose up -d --build
+        GLOSSARIES_DIR="$GLOSSARIES_DIR_VAL" HF_TOKEN="$HF_TOKEN_ENV" TRANSFORMERS_OFFLINE="$OFFLINE_MODE" HF_HUB_OFFLINE="$OFFLINE_MODE" MAX_CONCURRENT_TRANSLATIONS="$MAX_CONCURRENT_TRANSLATIONS_VAL" AUTO_SELECT_GPU="$AUTO_SELECT_GPU_VAL" ENABLE_API_KEY_AUTH="$ENABLE_API_KEY_AUTH_VAL" API_KEY_DB_PATH="api_keys.db" docker-compose up -d --build
         echo "Service is running on http://localhost:8888"
         echo "To view logs, run: docker-compose logs -f"
     else
@@ -143,12 +150,15 @@ if [ "$HAS_GPU" = true ]; then
           --gpus all \
           -v ~/.cache/huggingface:/root/.cache/huggingface \
           -v "$GLOSSARIES_HOST_DIR:/app/glossaries" \
+          -v "$API_KEY_DB_ABS_PATH:/app/api_keys.db" \
           -e TRANSFORMERS_OFFLINE="$OFFLINE_MODE" \
           -e HF_HUB_OFFLINE="$OFFLINE_MODE" \
           -e HF_TOKEN="$HF_TOKEN_ENV" \
           -e GLOSSARIES_DIR="glossaries" \
           -e MAX_CONCURRENT_TRANSLATIONS="$MAX_CONCURRENT_TRANSLATIONS_VAL" \
           -e AUTO_SELECT_GPU="$AUTO_SELECT_GPU_VAL" \
+          -e ENABLE_API_KEY_AUTH="$ENABLE_API_KEY_AUTH_VAL" \
+          -e API_KEY_DB_PATH="api_keys.db" \
           --name kalanjiyam-translation-api \
           kalanjiyam-translation
         echo "Service is running on http://localhost:8888"
@@ -168,18 +178,22 @@ if [ "$HAS_GPU" = false ]; then
       -p 8888:8888 \
       -v ~/.cache/huggingface:/root/.cache/huggingface \
       -v "$GLOSSARIES_HOST_DIR:/app/glossaries" \
+      -v "$API_KEY_DB_ABS_PATH:/app/api_keys.db" \
       -e TRANSFORMERS_OFFLINE="$OFFLINE_MODE" \
       -e HF_HUB_OFFLINE="$OFFLINE_MODE" \
       -e HF_TOKEN="$HF_TOKEN_ENV" \
       -e GLOSSARIES_DIR="glossaries" \
       -e MAX_CONCURRENT_TRANSLATIONS="$MAX_CONCURRENT_TRANSLATIONS_VAL" \
       -e AUTO_SELECT_GPU="$AUTO_SELECT_GPU_VAL" \
+      -e ENABLE_API_KEY_AUTH="$ENABLE_API_KEY_AUTH_VAL" \
+      -e API_KEY_DB_PATH="api_keys.db" \
       --name kalanjiyam-translation-api \
       kalanjiyam-translation
       
     echo "Service is running on http://localhost:8888"
     echo "To view logs, run: docker logs -f kalanjiyam-translation-api"
 fi
+
 
 echo "========================================================="
 echo "Note: The first translation request will download models"
