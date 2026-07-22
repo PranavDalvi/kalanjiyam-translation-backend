@@ -304,6 +304,17 @@ You can request glossaries using their full names or common abbreviations. The A
 - `"mathematics"` -> `math`
 - `"information technology"` -> `it`
 
+### 4. Multi-Glossary Selection & "all" Option
+You can request multiple glossaries or load all matching glossaries:
+- **Formats Supported**:
+  - **Single String**: `"administrative"`
+  - **JSON List**: `["administrative", "agri"]`
+  - **Comma-Separated String**: `"administrative, agri"`
+- **"all" Option**: If you specify `"all"` (e.g. `"all"`, `["all"]`, or `"administrative, all"`), the API dynamically resolves it by loading and merging all available glossary files for the requested source/target language pair on the disk.
+- **Precedence & Collision Resolution**:
+  - Glossaries are merged in the order they are passed (later ones override earlier ones).
+  - For `"all"`, files are loaded and merged in alphabetical order.
+
 ---
 
 ## Example calls
@@ -342,8 +353,80 @@ curl -X POST "http://127.0.0.1:8000/translate/document" \
   --output translated_output.docx
 ```
 
+---
+
+## API Key Authentication & Key Management
+
+API key verification is supported to secure translation endpoints (`/translate/text` and `/translate/document`).
+
+### 1. Configuration
+Set the following environment variables in `.env`:
+```env
+# Enable API Key authentication (1 = enabled, 0 = disabled)
+ENABLE_API_KEY_AUTH=1
+
+# Path to SQLite database storing hashed API keys
+API_KEY_DB_PATH=api_keys.db
+```
+
+### 2. CLI Key Management Tool
+Use the CLI tool `app.manage_keys` to create, list, and revoke API keys:
+
+#### Local Virtualenv Execution
+* **Generate a new API key**:
+  ```bash
+  python -m app.manage_keys create --name "Mobile App"
+  ```
+* **List all API keys**:
+  ```bash
+  python -m app.manage_keys list
+  ```
+* **Revoke an API key**:
+  ```bash
+  python -m app.manage_keys revoke kt_a1b2
+  # Or by ID:
+  python -m app.manage_keys revoke 1
+  ```
+
+#### Docker & Docker Compose Execution
+Run the CLI against a running container (or create a key in the volume-mounted database):
+
+* **Via Docker / Podman (`docker exec` / `podman exec`)**:
+  ```bash
+  docker exec -it kalanjiyam-translation-api python -m app.manage_keys create --name "Mobile App"
+  docker exec -it kalanjiyam-translation-api python -m app.manage_keys list
+  docker exec -it kalanjiyam-translation-api python -m app.manage_keys revoke kt_a1b2
+  ```
+  *(For Podman, replace `docker` with `podman`)*
+
+* **Via Docker Compose (`docker compose exec`)**:
+  ```bash
+  docker compose exec translation-api python -m app.manage_keys create --name "Mobile App"
+  docker compose exec translation-api python -m app.manage_keys list
+  docker compose exec translation-api python -m app.manage_keys revoke kt_a1b2
+  ```
+
+
+### 3. Using API Keys in Requests
+When `ENABLE_API_KEY_AUTH=1`, pass your API key via the `X-API-Key` HTTP header:
+
+```bash
+curl -sS -X POST "http://127.0.0.1:8000/translate/text" \
+  -H "X-API-Key: kt_a1b2c3d4e5f678901234567890abcdef" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "Hello world",
+    "model_name": "ai4bharat/indictrans2-en-indic-1B",
+    "source_language": "English",
+    "target_language": "Hindi"
+  }'
+```
+
+---
+
 ## Notes
 
 - API keeps your original offline behavior (`HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`).
 - Models are loaded lazily on first request and cached per `(gpu_id, model_type)`.
 - You must have local model files available in Hugging Face cache for offline mode.
+

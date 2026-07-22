@@ -7,11 +7,18 @@ services:
     volumes:
       - ~/.cache/huggingface:/root/.cache/huggingface
       - ${GLOSSARIES_DIR:-./glossaries}:/app/glossaries
+      - ./api_keys.db:/app/api_keys.db
+
     environment:
       - TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-1}
       - HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
       - HF_TOKEN=${HF_TOKEN:-}
-      - GLOSSARIES_DIR=${GLOSSARIES_DIR:-glossaries}
+      - GLOSSARIES_DIR=glossaries
+      - MAX_CONCURRENT_TRANSLATIONS=${MAX_CONCURRENT_TRANSLATIONS:-2}
+      - AUTO_SELECT_GPU=${AUTO_SELECT_GPU:-1}
+      - ENABLE_API_KEY_AUTH=${ENABLE_API_KEY_AUTH:-0}
+      - API_KEY_DB_PATH=api_keys.db
+
     deploy:
       resources:
         reservations:

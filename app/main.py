@@ -3,8 +3,21 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import types
-from typing import Dict, List, Optional, Tuple, Literal, Set
+import logging
+import traceback
+from typing import Dict, List, Optional, Tuple, Literal, Set, Union
+
+# Set up logging configuration
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger("translation_backend")
 
 # Force progress bars (like tqdm) to render in non-TTY environments (e.g., Docker logs)
 sys.stderr.isatty = lambda: True
@@ -13,12 +26,14 @@ sys.stdout.isatty = lambda: True
 
 import pdfplumber
 import torch
+torch.set_num_threads(1)
 from docx import Document
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, BackgroundTasks
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, BackgroundTasks, Depends
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 from app.glossary import GlossaryService, pre_translate_replace, post_translate_replace
+from app.api_key import verify_api_key_dependency
 
 glossary_service = GlossaryService()
 
@@ -97,7 +112,7 @@ class TranslateTextRequest(BaseModel):
     target_language: str
     gpu_id: int = 0
     batch_size: int = Field(default=8, ge=1, le=64)
-    glossary: Optional[str] = None
+    glossary: Optional[Union[str, List[str]]] = None
 
 
 class TranslationService:
@@ -105,13 +120,38 @@ class TranslationService:
         try:
             self.available_gpus = list(range(torch.cuda.device_count()))
         except Exception as e:
-            print(f"Failed to query CUDA devices: {e}. Disabling GPU support.")
+            logger.exception("Failed to query CUDA devices. Disabling GPU support.")
             self.available_gpus = []
         self.loaded_models: Dict[Tuple[str, str], Dict[str, object]] = {}
+        self.last_used: Dict[Tuple[str, str], float] = {}
         self.active_downloads: Set[str] = set()
         self._lock = threading.Lock()
         self._inference_locks: Dict[int, threading.Lock] = {}
         self._inference_locks_lock = threading.Lock()
+
+    def unload_idle_models(self, idle_timeout_seconds: float) -> None:
+        now = time.time()
+        unloaded_any = False
+        with self._lock:
+            keys_to_unload = [
+                key for key, last_time in self.last_used.items()
+                if now - last_time > idle_timeout_seconds
+            ]
+            for key in keys_to_unload:
+                logger.info(f"Auto-unloading idle model: device={key[0]}, model_key={key[1]}")
+                bundle = self.loaded_models.pop(key, None)
+                self.last_used.pop(key, None)
+                if bundle:
+                    del bundle["model"]
+                    del bundle["tokenizer"]
+                    del bundle["ip"]
+                    unloaded_any = True
+
+        if unloaded_any:
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     def _get_inference_lock(self, model: object) -> threading.Lock:
         model_id = id(model)
@@ -137,31 +177,46 @@ class TranslationService:
     ) -> Tuple[AutoModelForSeq2SeqLM, AutoTokenizer, object]:
         model_key, model_name = self._resolve_model(model_name, src_lang_name, tgt_lang_name)
 
-        use_cuda = False
-        device = "cpu"
-
-        if self.available_gpus and gpu_id in self.available_gpus:
-            try:
-                # Test CUDA initialization
-                test_tensor = torch.zeros(1).to(f"cuda:{gpu_id}")
-                del test_tensor
-                device = f"cuda:{gpu_id}"
-                use_cuda = True
-            except Exception as e:
-                print(f"CUDA initialization failed for GPU {gpu_id} ({e}). Falling back to CPU.")
-        else:
-            print(f"GPU {gpu_id} not available or no CUDA GPUs detected. Falling back to CPU.")
-
-        cache_key = (device, model_key)
-
-        if cache_key in self.loaded_models:
-            bundle = self.loaded_models[cache_key]
-            return bundle["model"], bundle["tokenizer"], bundle["ip"]
-
+        # 1. Quick check if already loaded on any device to reuse it and avoid concurrent VRAM checks
         with self._lock:
-            if cache_key in self.loaded_models:
-                bundle = self.loaded_models[cache_key]
-                return bundle["model"], bundle["tokenizer"], bundle["ip"]
+            for key, bundle in self.loaded_models.items():
+                if key[1] == model_key:
+                    self.last_used[key] = time.time()
+                    return bundle["model"], bundle["tokenizer"], bundle["ip"]
+
+            # 2. Select GPU under the lock if not loaded
+            auto_select = os.environ.get("AUTO_SELECT_GPU", "1").lower() not in ("0", "false")
+            if auto_select and len(self.available_gpus) > 1:
+                best_gpu = gpu_id
+                max_free = 0
+                for gid in self.available_gpus:
+                    try:
+                        free, total = torch.cuda.mem_get_info(gid)
+                        if free > max_free:
+                            max_free = free
+                            best_gpu = gid
+                    except Exception as e:
+                        logger.warning(f"Failed to query memory info for GPU {gid}: {e}")
+                if best_gpu != gpu_id:
+                    logger.info(f"Auto-selected GPU {best_gpu} (free VRAM: {max_free / (1024**2):.1f} MiB) over requested GPU {gpu_id}")
+                    gpu_id = best_gpu
+
+            use_cuda = False
+            device = "cpu"
+
+            if self.available_gpus and gpu_id in self.available_gpus:
+                try:
+                    torch.cuda.set_device(gpu_id)
+                    test_tensor = torch.zeros(1).to(f"cuda:{gpu_id}")
+                    del test_tensor
+                    device = f"cuda:{gpu_id}"
+                    use_cuda = True
+                except Exception as e:
+                    logger.warning(f"CUDA initialization failed for GPU {gpu_id} ({e}). Falling back to CPU.")
+            else:
+                logger.info(f"GPU {gpu_id} not available or no CUDA GPUs detected. Falling back to CPU.")
+
+            cache_key = (device, model_key)
 
             # Import lazily so non-translation endpoints can run even if model deps are not ready.
             from IndicTransToolkit.processor import IndicProcessor
@@ -179,6 +234,8 @@ class TranslationService:
 
                 dtype = torch.float16 if use_cuda else torch.float32
                 try:
+                    if use_cuda:
+                        torch.cuda.set_device(gpu_id)
                     model = AutoModelForSeq2SeqLM.from_pretrained(
                         model_name,
                         trust_remote_code=True,
@@ -188,12 +245,13 @@ class TranslationService:
                     model.eval()
                 except Exception as e:
                     if use_cuda:
-                        print(f"Failed to load model on GPU: {e}. Retrying CPU fallback.")
+                        logger.warning(f"Failed to load model on GPU: {e}. Retrying CPU fallback.")
                         device = "cpu"
                         use_cuda = False
                         cache_key = (device, model_key)
                         if cache_key in self.loaded_models:
                             bundle = self.loaded_models[cache_key]
+                            self.last_used[cache_key] = time.time()
                             return bundle["model"], bundle["tokenizer"], bundle["ip"]
 
                         model = AutoModelForSeq2SeqLM.from_pretrained(
@@ -209,6 +267,7 @@ class TranslationService:
                 self.active_downloads.discard(model_name)
 
             self.loaded_models[cache_key] = {"model": model, "tokenizer": tokenizer, "ip": ip}
+            self.last_used[cache_key] = time.time()
             return model, tokenizer, ip
 
     def _is_model_cached(self, model_name: str) -> bool:
@@ -280,53 +339,64 @@ class TranslationService:
         all_translations: List[str] = []
         total_sentences = len(preprocessed_sentences)
 
-        for i in range(0, total_sentences, batch_size):
-            batch = preprocessed_sentences[i : i + batch_size]
-            batch_mappings = mappings[i : i + batch_size]
-            valid_indices = [idx for idx, s in enumerate(batch) if s.strip()]
-            valid_sentences = [batch[idx] for idx in valid_indices]
+        try:
+            for i in range(0, total_sentences, batch_size):
+                batch = preprocessed_sentences[i : i + batch_size]
+                batch_mappings = mappings[i : i + batch_size]
+                valid_indices = [idx for idx, s in enumerate(batch) if s.strip()]
+                valid_sentences = [batch[idx] for idx in valid_indices]
 
-            if valid_sentences:
-                preprocessed = ip.preprocess_batch(valid_sentences, src_lang=src_lang, tgt_lang=tgt_lang)
-                inputs = tokenizer(
-                    preprocessed,
-                    truncation=True,
-                    padding="longest",
-                    return_tensors="pt",
-                )
-
-                lock = self._get_inference_lock(model)
-                with lock:
-                    inputs = inputs.to(model.device)
-                    with torch.no_grad():
-                        generated_tokens = model.generate(
-                            **inputs,
-                            use_cache=True,
-                            min_length=0,
-                            max_length=512,
-                            num_beams=4,
-                            early_stopping=True,
+                if valid_sentences:
+                    lock = self._get_inference_lock(model)
+                    with lock:
+                        if model.device.type == "cuda":
+                            torch.cuda.set_device(model.device)
+                        
+                        preprocessed = ip.preprocess_batch(valid_sentences, src_lang=src_lang, tgt_lang=tgt_lang)
+                        inputs = tokenizer(
+                            preprocessed,
+                            truncation=True,
+                            padding="longest",
+                            return_tensors="pt",
                         )
+                        inputs = inputs.to(model.device)
+                        with torch.no_grad():
+                            generated_tokens = model.generate(
+                                **inputs,
+                                use_cache=True,
+                                min_length=0,
+                                max_length=512,
+                                num_beams=4,
+                                early_stopping=True,
+                            )
 
-                    translations = tokenizer.batch_decode(
-                        generated_tokens.detach().cpu().tolist(),
-                        skip_special_tokens=True,
-                    )
-                translations = ip.postprocess_batch(translations, lang=tgt_lang)
+                        translations = tokenizer.batch_decode(
+                            generated_tokens.detach().cpu().tolist(),
+                            skip_special_tokens=True,
+                        )
+                        translations = ip.postprocess_batch(translations, lang=tgt_lang)
 
-                for idx, trans in zip(valid_indices, translations):
-                    mapping = batch_mappings[idx]
-                    if mapping:
-                        trans = post_translate_replace(trans, mapping)
-                    batch[idx] = trans
+                    for idx, trans in zip(valid_indices, translations):
+                        mapping = batch_mappings[idx]
+                        if mapping:
+                            trans = post_translate_replace(trans, mapping)
+                        batch[idx] = trans
 
-            all_translations.extend(batch)
-
-        if model.device.type == "cuda":
-            try:
-                torch.cuda.empty_cache()
-            except Exception:
-                pass
+                all_translations.extend(batch)
+        except Exception as e:
+            logger.exception("Error occurred during batch translation execution:")
+            if model.device.type == "cuda" or torch.cuda.is_available():
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+            raise e
+        finally:
+            if model.device.type == "cuda":
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
 
         return all_translations
 
@@ -389,12 +459,43 @@ class TranslationService:
 service = TranslationService()
 app = FastAPI(title="Kalanjiyam Translation API", version="1.0.0")
 
+# Concurrency semaphore to throttle concurrent translation executions
+MAX_CONCURRENT_TRANSLATIONS = int(os.environ.get("MAX_CONCURRENT_TRANSLATIONS", 2))
+translation_semaphore = threading.Semaphore(MAX_CONCURRENT_TRANSLATIONS)
+
+from fastapi import Request
+from fastapi.responses import JSONResponse
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.exception(f"Unhandled exception occurred during request to {request.url.path}:")
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"Internal Server Error: {str(exc)}"},
+    )
+
+
+def start_model_cleanup_worker():
+    def cleanup_loop():
+        idle_timeout = float(os.environ.get("MODEL_IDLE_TIMEOUT", "1800"))
+        logger.info(f"Starting background translation model cleanup worker (idle_timeout={idle_timeout}s)")
+        while True:
+            try:
+                time.sleep(60)
+                service.unload_idle_models(idle_timeout)
+            except Exception as e:
+                logger.error(f"Error in model cleanup worker: {e}")
+
+    t = threading.Thread(target=cleanup_loop, daemon=True)
+    t.start()
+
 
 @app.on_event("startup")
 def preload_models():
+    start_model_cleanup_worker()
     offline_mode = os.environ.get("TRANSFORMERS_OFFLINE", "1") == "1"
     if not offline_mode:
-        print("Preloading default translation model (ai4bharat/indictrans2-en-indic-1B) on startup...")
+        logger.info("Preloading default translation model (ai4bharat/indictrans2-en-indic-1B) on startup...")
         try:
             service.get_translation_model(
                 MODEL_EN_INDIC,
@@ -402,9 +503,9 @@ def preload_models():
                 "Hindi",
                 0
             )
-            print("Default model preloaded successfully.")
+            logger.info("Default model preloaded successfully.")
         except Exception as e:
-            print(f"Error preloading model during startup: {e}")
+            logger.exception("Error preloading model during startup:")
 
 
 @app.get("/health")
@@ -452,66 +553,83 @@ def list_glossaries() -> List[Dict[str, str]]:
                         "filename": filename
                     })
     except Exception as e:
-        print(f"Error listing glossaries: {e}")
+        logger.exception("Error listing glossaries:")
 
     return available
 
 
-@app.post("/translate/text")
+@app.post("/translate/text", dependencies=[Depends(verify_api_key_dependency)])
 def translate_text(payload: TranslateTextRequest) -> Dict[str, str]:
+    logger.info(
+        f"Incoming Text Request: source_lang={payload.source_language}, "
+        f"target_lang={payload.target_language}, model_name={payload.model_name}, "
+        f"text_length={len(payload.text)} chars"
+    )
     src_lang = LANGUAGES.get(payload.source_language)
     tgt_lang = LANGUAGES.get(payload.target_language)
 
     if not src_lang or not tgt_lang:
         raise HTTPException(status_code=400, detail="Invalid source or target language.")
 
-    try:
-        model, tokenizer, ip = service.get_translation_model(
-            payload.model_name,
-            payload.source_language,
-            payload.target_language,
-            payload.gpu_id,
-        )
-    except HTTPException as he:
-        raise he
-    except Exception as e:
-        err_msg = str(e)
-        if "offline" in err_msg.lower() or "local_files" in err_msg.lower() or "does not appear to have a file named" in err_msg.lower():
-            raise HTTPException(
-                status_code=503,
-                detail=f"Translation model failed to load. The local cache is likely incomplete or corrupted. Try running './setup_and_run.sh' to download/repair the cache. Error: {err_msg}"
+    with translation_semaphore:
+        try:
+            model, tokenizer, ip = service.get_translation_model(
+                payload.model_name,
+                payload.source_language,
+                payload.target_language,
+                payload.gpu_id,
             )
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to load translation model: {err_msg}"
-        )
+        except HTTPException as he:
+            raise he
+        except Exception as e:
+            err_msg = str(e)
+            if "offline" in err_msg.lower() or "local_files" in err_msg.lower() or "does not appear to have a file named" in err_msg.lower():
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Translation model failed to load. The local cache is likely incomplete or corrupted. Try running './setup_and_run.sh' to download/repair the cache. Error: {err_msg}"
+                )
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to load translation model: {err_msg}"
+            )
 
-    # Load glossary mapping if requested
-    glossary_dict = None
-    if payload.glossary:
-        glossary_dict = glossary_service.get_glossary_dict(
-            payload.glossary,
-            payload.source_language,
-            payload.target_language
-        )
+        # Load glossary mapping if requested
+        glossary_dict = None
+        if payload.glossary:
+            glossary_dict = glossary_service.get_merged_glossary_dict(
+                payload.glossary,
+                payload.source_language,
+                payload.target_language
+            )
 
-    # Split text by newlines to prevent silent truncation on long texts
-    lines = payload.text.split("\n")
-    translated_lines = service.translate_batch_memory_safe(
-        lines,
-        model,
-        tokenizer,
-        ip,
-        src_lang,
-        tgt_lang,
-        batch_size=payload.batch_size,
-        glossary_dict=glossary_dict,
+        # Split text by newlines to prevent silent truncation on long texts
+        lines = payload.text.split("\n")
+        try:
+            translated_lines = service.translate_batch_memory_safe(
+                lines,
+                model,
+                tokenizer,
+                ip,
+                src_lang,
+                tgt_lang,
+                batch_size=payload.batch_size,
+                glossary_dict=glossary_dict,
+            )
+        except Exception as e:
+            logger.exception("Text translation endpoint failed:")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Translation processing failed: {str(e)}"
+            )
+
+    translated_text = "\n".join(translated_lines)
+    logger.info(
+        f"Outgoing Text Response: text_length={len(translated_text)} chars"
     )
+    return {"text": translated_text}
 
-    return {"text": "\n".join(translated_lines)}
 
-
-@app.post("/translate/document")
+@app.post("/translate/document", dependencies=[Depends(verify_api_key_dependency)])
 def translate_document(
     file: UploadFile = File(...),
     model_name: str = Form(...),
@@ -522,102 +640,116 @@ def translate_document(
     glossary: Optional[str] = Form(None),
     background_tasks: BackgroundTasks = None,
 ) -> FileResponse:
+    logger.info(
+        f"Incoming Document Request: filename={file.filename}, "
+        f"source_lang={source_language}, target_lang={target_language}, "
+        f"model_name={model_name}"
+    )
     src_lang = LANGUAGES.get(source_language)
     tgt_lang = LANGUAGES.get(target_language)
 
     if not src_lang or not tgt_lang:
         raise HTTPException(status_code=400, detail="Invalid source or target language.")
 
-    try:
-        model, tokenizer, ip = service.get_translation_model(model_name, source_language, target_language, gpu_id)
-    except HTTPException as he:
-        raise he
-    except Exception as e:
-        err_msg = str(e)
-        if "offline" in err_msg.lower() or "local_files" in err_msg.lower() or "does not appear to have a file named" in err_msg.lower():
+    with translation_semaphore:
+        try:
+            model, tokenizer, ip = service.get_translation_model(model_name, source_language, target_language, gpu_id)
+        except HTTPException as he:
+            raise he
+        except Exception as e:
+            err_msg = str(e)
+            if "offline" in err_msg.lower() or "local_files" in err_msg.lower() or "does not appear to have a file named" in err_msg.lower():
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Translation model failed to load. The local cache is likely incomplete or corrupted. Try running './setup_and_run.sh' to download/repair the cache. Error: {err_msg}"
+                )
             raise HTTPException(
-                status_code=503,
-                detail=f"Translation model failed to load. The local cache is likely incomplete or corrupted. Try running './setup_and_run.sh' to download/repair the cache. Error: {err_msg}"
+                status_code=500,
+                detail=f"Failed to load translation model: {err_msg}"
             )
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to load translation model: {err_msg}"
-        )
 
-    # Load glossary mapping if requested
-    glossary_dict = None
-    if glossary:
-        glossary_dict = glossary_service.get_glossary_dict(
-            glossary,
-            source_language,
-            target_language
-        )
-
-    ext = os.path.splitext(file.filename or "")[1].lower()
-    if ext not in {".docx", ".pdf", ".txt"}:
-        raise HTTPException(status_code=400, detail="Unsupported file type. Use .docx, .pdf, or .txt")
-
-    with tempfile.TemporaryDirectory() as temp_dir:
-        input_path = os.path.join(temp_dir, f"input{ext}")
-        output_path = os.path.join(temp_dir, "translated_output.docx")
-
-        content = file.file.read()
-        with open(input_path, "wb") as handle:
-            handle.write(content)
-
-        if ext == ".docx":
-            doc = service.process_docx(input_path, model, tokenizer, ip, src_lang, tgt_lang, batch_size, glossary_dict)
-            doc.save(output_path)
-
-        elif ext == ".pdf":
-            text_list: List[str] = []
-            with pdfplumber.open(io.BytesIO(content)) as pdf:
-                for page in pdf.pages:
-                    page_text = page.extract_text()
-                    if page_text:
-                        text_list.append(page_text)
-            full_text = "\n".join(text_list)
-            translated = service.translate_batch_memory_safe(
-                full_text.split("\n"),
-                model,
-                tokenizer,
-                ip,
-                src_lang,
-                tgt_lang,
-                batch_size=batch_size,
-                glossary_dict=glossary_dict,
+        # Load glossary mapping if requested
+        glossary_dict = None
+        if glossary:
+            glossary_dict = glossary_service.get_merged_glossary_dict(
+                glossary,
+                source_language,
+                target_language
             )
-            doc = Document()
-            for line in translated:
-                doc.add_paragraph(line)
-            doc.save(output_path)
 
-        else:  # .txt
-            with open(input_path, "r", encoding="utf-8") as handle:
-                lines = [line.strip() for line in handle.readlines() if line.strip()]
-            translated = service.translate_batch_memory_safe(
-                lines,
-                model,
-                tokenizer,
-                ip,
-                src_lang,
-                tgt_lang,
-                batch_size=batch_size,
-                glossary_dict=glossary_dict,
+        ext = os.path.splitext(file.filename or "")[1].lower()
+        if ext not in {".docx", ".pdf", ".txt"}:
+            raise HTTPException(status_code=400, detail="Unsupported file type. Use .docx, .pdf, or .txt")
+
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                input_path = os.path.join(temp_dir, f"input{ext}")
+                output_path = os.path.join(temp_dir, "translated_output.docx")
+
+                content = file.file.read()
+                with open(input_path, "wb") as handle:
+                    handle.write(content)
+
+                if ext == ".docx":
+                    doc = service.process_docx(input_path, model, tokenizer, ip, src_lang, tgt_lang, batch_size, glossary_dict)
+                    doc.save(output_path)
+
+                elif ext == ".pdf":
+                    text_list: List[str] = []
+                    with pdfplumber.open(io.BytesIO(content)) as pdf:
+                        for page in pdf.pages:
+                            page_text = page.extract_text()
+                            if page_text:
+                                text_list.append(page_text)
+                    full_text = "\n".join(text_list)
+                    translated = service.translate_batch_memory_safe(
+                        full_text.split("\n"),
+                        model,
+                        tokenizer,
+                        ip,
+                        src_lang,
+                        tgt_lang,
+                        batch_size=batch_size,
+                        glossary_dict=glossary_dict,
+                    )
+                    doc = Document()
+                    for line in translated:
+                        doc.add_paragraph(line)
+                    doc.save(output_path)
+
+                else:  # .txt
+                    with open(input_path, "r", encoding="utf-8") as handle:
+                        lines = [line.strip() for line in handle.readlines() if line.strip()]
+                    translated = service.translate_batch_memory_safe(
+                        lines,
+                        model,
+                        tokenizer,
+                        ip,
+                        src_lang,
+                        tgt_lang,
+                        batch_size=batch_size,
+                        glossary_dict=glossary_dict,
+                    )
+                    doc = Document()
+                    for line in translated:
+                        doc.add_paragraph(line)
+                    doc.save(output_path)
+
+                final_name = os.path.splitext(file.filename or "document")[0] + f"_translated_{target_language}.docx"
+                persisted_path = os.path.join(os.getcwd(), final_name)
+                with open(output_path, "rb") as src_file, open(persisted_path, "wb") as dst_file:
+                    dst_file.write(src_file.read())
+        except Exception as e:
+            logger.exception("Document translation endpoint failed:")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Document processing or translation failed: {str(e)}"
             )
-            doc = Document()
-            for line in translated:
-                doc.add_paragraph(line)
-            doc.save(output_path)
-
-        final_name = os.path.splitext(file.filename or "document")[0] + f"_translated_{target_language}.docx"
-        persisted_path = os.path.join(os.getcwd(), final_name)
-        with open(output_path, "rb") as src_file, open(persisted_path, "wb") as dst_file:
-            dst_file.write(src_file.read())
 
     if background_tasks:
         background_tasks.add_task(os.remove, persisted_path)
 
+    logger.info(f"Outgoing Document Response: final_filename={final_name}")
     return FileResponse(
         path=persisted_path,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
