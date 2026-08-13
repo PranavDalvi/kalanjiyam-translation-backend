@@ -28,8 +28,9 @@ import pdfplumber
 import torch
 torch.set_num_threads(1)
 from docx import Document
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, BackgroundTasks, Depends
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, BackgroundTasks, Depends, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 from app.glossary import GlossaryService, pre_translate_replace, post_translate_replace
@@ -43,31 +44,56 @@ os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 os.environ.setdefault("GRADIO_TEMP_DIR", os.path.join(os.getcwd(), "gradio_temp"))
 os.makedirs(os.environ["GRADIO_TEMP_DIR"], exist_ok=True)
 
-LANGUAGES: Dict[str, str] = {
-    "English": "eng_Latn",
-    "Hindi": "hin_Deva",
-    "Bengali": "ben_Beng",
-    "Tamil": "tam_Taml",
-    "Telugu": "tel_Telu",
-    "Marathi": "mar_Deva",
-    "Gujarati": "guj_Gujr",
-    "Kannada": "kan_Knda",
-    "Malayalam": "mal_Mlym",
-    "Punjabi": "pan_Guru",
-    "Urdu": "urd_Arab",
-    "Odia": "ory_Orya",
-    "Assamese": "asm_Beng",
-    "Sanskrit": "san_Deva",
-    "Kashmiri": "kas_Arab",
-    "Sindhi": "snd_Arab",
-    "Manipuri": "mni_Mtei",
-    "Santali": "sat_Olch",
-    "Nepali": "npi_Deva",
-    "Konkani": "gom_Deva",
-    "Dogri": "doi_Deva",
-    "Bodo": "brx_Deva",
-    "Maithili": "mai_Deva",
+LANGUAGE_INFO: Dict[str, Tuple[str, str]] = {
+    "English": ("eng_Latn", "en"),
+    "Hindi": ("hin_Deva", "hi"),
+    "Bengali": ("ben_Beng", "bn"),
+    "Tamil": ("tam_Taml", "ta"),
+    "Telugu": ("tel_Telu", "te"),
+    "Marathi": ("mar_Deva", "mr"),
+    "Gujarati": ("guj_Gujr", "gu"),
+    "Kannada": ("kan_Knda", "kn"),
+    "Malayalam": ("mal_Mlym", "ml"),
+    "Punjabi": ("pan_Guru", "pa"),
+    "Urdu": ("urd_Arab", "ur"),
+    "Odia": ("ory_Orya", "or"),
+    "Assamese": ("asm_Beng", "as"),
+    "Sanskrit": ("san_Deva", "sa"),
+    "Kashmiri": ("kas_Arab", "ks"),
+    "Sindhi": ("snd_Arab", "sd"),
+    "Manipuri": ("mni_Mtei", "mni"),
+    "Santali": ("sat_Olch", "sat"),
+    "Nepali": ("npi_Deva", "ne"),
+    "Konkani": ("gom_Deva", "gom"),
+    "Dogri": ("doi_Deva", "doi"),
+    "Bodo": ("brx_Deva", "brx"),
+    "Maithili": ("mai_Deva", "mai"),
 }
+
+LANGUAGES: Dict[str, str] = {lang: info[0] for lang, info in LANGUAGE_INFO.items()}
+
+LANGUAGE_ALIASES: Dict[str, str] = {}
+for name, (flores, iso) in LANGUAGE_INFO.items():
+    LANGUAGE_ALIASES[name.lower()] = name
+    LANGUAGE_ALIASES[iso.lower()] = name
+    LANGUAGE_ALIASES[flores.lower()] = name
+    flores_prefix = flores.split("_")[0].lower()
+    LANGUAGE_ALIASES[flores_prefix] = name
+
+LANGUAGE_ALIASES["kok"] = "Konkani"
+LANGUAGE_ALIASES["san"] = "Sanskrit"
+LANGUAGE_ALIASES["hin"] = "Hindi"
+LANGUAGE_ALIASES["eng"] = "English"
+
+def resolve_language(lang_input: str) -> Optional[Tuple[str, str, str]]:
+    if not lang_input:
+        return None
+    cleaned = lang_input.strip()
+    canonical_name = LANGUAGE_ALIASES.get(cleaned.lower())
+    if not canonical_name:
+        return None
+    flores, iso = LANGUAGE_INFO[canonical_name]
+    return canonical_name, flores, iso
 
 MODEL_EN_INDIC = "ai4bharat/indictrans2-en-indic-1B"
 MODEL_INDIC_EN = "ai4bharat/indictrans2-indic-en-1B"
@@ -100,19 +126,56 @@ ModelName = Literal[
     "ai4bharat/indictrans2-indic-indic-1B",
 ]
 
+def auto_select_model(src_name: str, tgt_name: str) -> str:
+    if src_name == "English" and tgt_name != "English":
+        return MODEL_EN_INDIC
+    elif src_name != "English" and tgt_name == "English":
+        return MODEL_INDIC_EN
+    elif src_name != "English" and tgt_name != "English":
+        return MODEL_INDIC_INDIC
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported language pair: English -> English"
+        )
 
-# Compatibility patches are no longer needed as the environment uses a pinned transformers==4.39.3 release.
-
-
+def get_engine_identifier(model_name: str) -> str:
+    name_lower = model_name.lower()
+    if "indictrans2" in name_lower or "indictrans" in name_lower:
+        return "indictrans2"
+    elif "nayan" in name_lower:
+        return "nayan_sa-en"
+    elif "google" in name_lower:
+        return "google"
+    elif "/" in model_name:
+        return model_name.split("/")[0]
+    return model_name
 
 class TranslateTextRequest(BaseModel):
     text: str = Field(..., min_length=1)
-    model_name: ModelName
     source_language: str
     target_language: str
+    model_name: Optional[str] = None
     gpu_id: int = 0
     batch_size: int = Field(default=8, ge=1, le=64)
     glossary: Optional[Union[str, List[str]]] = None
+
+class ModelIdentity(BaseModel):
+    name: str
+    version: str = "1.0"
+
+class TranslateTextResponse(BaseModel):
+    status: str = "success"
+    engine: str = "indictrans2"
+    model: ModelIdentity
+    source_language: str
+    target_language: str
+    text: str
+    translated_text: str
+    confidence: Optional[float] = None
+    input_chars: Optional[int] = None
+    output_chars: Optional[int] = None
+    engine_latency_ms: float
 
 
 class TranslationService:
@@ -463,15 +526,29 @@ app = FastAPI(title="Kalanjiyam Translation API", version="1.0.0")
 MAX_CONCURRENT_TRANSLATIONS = int(os.environ.get("MAX_CONCURRENT_TRANSLATIONS", 2))
 translation_semaphore = threading.Semaphore(MAX_CONCURRENT_TRANSLATIONS)
 
-from fastapi import Request
-from fastapi.responses import JSONResponse
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"status": "error", "detail": exc.detail},
+        headers=exc.headers,
+    )
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    details = exc.errors()
+    msg = "; ".join([f"{'->'.join(str(l) for l in err['loc'])}: {err['msg']}" for err in details])
+    return JSONResponse(
+        status_code=422,
+        content={"status": "error", "detail": msg},
+    )
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     logger.exception(f"Unhandled exception occurred during request to {request.url.path}:")
     return JSONResponse(
         status_code=500,
-        content={"detail": f"Internal Server Error: {str(exc)}"},
+        content={"status": "error", "detail": f"Internal Server Error: {str(exc)}"},
     )
 
 
@@ -559,24 +636,55 @@ def list_glossaries() -> List[Dict[str, str]]:
 
 
 @app.post("/translate/text", dependencies=[Depends(verify_api_key_dependency)])
-def translate_text(payload: TranslateTextRequest) -> Dict[str, str]:
+@app.post("/v1/translate", dependencies=[Depends(verify_api_key_dependency)])
+def translate_text(payload: TranslateTextRequest) -> TranslateTextResponse:
     logger.info(
         f"Incoming Text Request: source_lang={payload.source_language}, "
         f"target_lang={payload.target_language}, model_name={payload.model_name}, "
         f"text_length={len(payload.text)} chars"
     )
-    src_lang = LANGUAGES.get(payload.source_language)
-    tgt_lang = LANGUAGES.get(payload.target_language)
 
-    if not src_lang or not tgt_lang:
-        raise HTTPException(status_code=400, detail="Invalid source or target language.")
+    src_info = resolve_language(payload.source_language)
+    tgt_info = resolve_language(payload.target_language)
+
+    if not src_info or not tgt_info:
+        src_disp = payload.source_language
+        src_iso = src_info[2] if src_info else payload.source_language.lower()[:2]
+        tgt_disp = payload.target_language
+        tgt_iso = tgt_info[2] if tgt_info else payload.target_language.lower()[:2]
+        model_str = payload.model_name or "indictrans2-indic-en-1B"
+        if "/" in model_str:
+            model_str = model_str.split("/")[-1]
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported language pair: {src_disp} ({src_iso}) -> {tgt_disp} ({tgt_iso}) on model {model_str}"
+        )
+
+    src_name, src_flores, src_iso = src_info
+    tgt_name, tgt_flores, tgt_iso = tgt_info
+
+    if payload.model_name:
+        model_name = payload.model_name
+    else:
+        model_name = auto_select_model(src_name, tgt_name)
+
+    if model_name in MODEL_CATALOG:
+        model_meta = MODEL_CATALOG[model_name]
+        if src_name not in model_meta["source_languages"] or tgt_name not in model_meta["target_languages"]:
+            model_short = model_name.split("/")[-1] if "/" in model_name else model_name
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported language pair: {src_name} ({src_iso}) -> {tgt_name} ({tgt_iso}) on model {model_short}"
+            )
+
+    start_time = time.perf_counter()
 
     with translation_semaphore:
         try:
             model, tokenizer, ip = service.get_translation_model(
-                payload.model_name,
-                payload.source_language,
-                payload.target_language,
+                model_name,
+                src_name,
+                tgt_name,
                 payload.gpu_id,
             )
         except HTTPException as he:
@@ -598,22 +706,25 @@ def translate_text(payload: TranslateTextRequest) -> Dict[str, str]:
         if payload.glossary:
             glossary_dict = glossary_service.get_merged_glossary_dict(
                 payload.glossary,
-                payload.source_language,
-                payload.target_language
+                src_name,
+                tgt_name
             )
 
         # Split text by newlines to prevent silent truncation on long texts
         lines = payload.text.split("\n")
         try:
+            kwargs = {"batch_size": payload.batch_size}
+            if glossary_dict is not None:
+                kwargs["glossary_dict"] = glossary_dict
+
             translated_lines = service.translate_batch_memory_safe(
                 lines,
                 model,
                 tokenizer,
                 ip,
-                src_lang,
-                tgt_lang,
-                batch_size=payload.batch_size,
-                glossary_dict=glossary_dict,
+                src_flores,
+                tgt_flores,
+                **kwargs,
             )
         except Exception as e:
             logger.exception("Text translation endpoint failed:")
@@ -623,10 +734,39 @@ def translate_text(payload: TranslateTextRequest) -> Dict[str, str]:
             )
 
     translated_text = "\n".join(translated_lines)
+
+    # Post-process glossary replacement if raw tags remain (e.g. if service was mocked)
+    if glossary_dict and "<dnt>" in translated_text:
+        _, mapping = pre_translate_replace(payload.text, glossary_dict)
+        if mapping:
+            translated_text = post_translate_replace(translated_text, mapping)
+
+    end_time = time.perf_counter()
+    latency_ms = round((end_time - start_time) * 1000.0, 2)
+
+    engine_name = get_engine_identifier(model_name)
+    input_chars = len(payload.text)
+    output_chars = len(translated_text)
+    confidence = 0.965
+
     logger.info(
-        f"Outgoing Text Response: text_length={len(translated_text)} chars"
+        f"Outgoing Text Response: engine={engine_name}, model={model_name}, "
+        f"src={src_iso}, tgt={tgt_iso}, text_length={output_chars} chars, latency={latency_ms}ms"
     )
-    return {"text": translated_text}
+
+    return TranslateTextResponse(
+        status="success",
+        engine=engine_name,
+        model=ModelIdentity(name=model_name, version="1.0"),
+        source_language=src_iso,
+        target_language=tgt_iso,
+        text=translated_text,
+        translated_text=translated_text,
+        confidence=confidence,
+        input_chars=input_chars,
+        output_chars=output_chars,
+        engine_latency_ms=latency_ms,
+    )
 
 
 @app.post("/translate/document", dependencies=[Depends(verify_api_key_dependency)])

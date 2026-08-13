@@ -206,35 +206,50 @@ Example:
 }
 ```
 
-### `POST /translate/text`
+### `POST /translate/text` & `POST /v1/translate`
 
-- Input (`application/json`):
-
-```json
-{
-  "text": "Hello world",
-  "model_name": "ai4bharat/indictrans2-en-indic-1B",
-  "source_language": "English",
-  "target_language": "Hindi",
-  "gpu_id": 0,
-  "batch_size": 8,
-  "glossary": "administrative"
-}
-```
-*(Note: `glossary` is optional. Pass the glossary prefix or name, e.g. `"administrative"`, `"agriculture"`, etc.)*
-
-- Expected output (`200 OK`):
+- Request (`application/json`):
 
 ```json
 {
-  "text": "...translated text..."
+  "text": "धर्मक्षेत्रे कुरुक्षेत्रे समवेता युयुत्सवः।",
+  "source_language": "Sanskrit",
+  "target_language": "English",
+  "model_name": "ai4bharat/indictrans2-indic-en-1B",
+  "batch_size": 8
+}
+```
+*(Note: `model_name` and `glossary` are optional. `source_language` and `target_language` accept both English names like `"Sanskrit"` and ISO/BCP-47 short codes like `"sa"`.)*
+
+- Single JSON Response (`200 OK`):
+
+```json
+{
+  "status": "success",
+  "engine": "indictrans2",
+  "model": {
+    "name": "ai4bharat/indictrans2-indic-en-1B",
+    "version": "1.0"
+  },
+  "source_language": "sa",
+  "target_language": "en",
+  "text": "Gathered together on the sacred field of Kurukshetra, eager for battle...",
+  "translated_text": "Gathered together on the sacred field of Kurukshetra, eager for battle...",
+  "confidence": 0.965,
+  "input_chars": 42,
+  "output_chars": 73,
+  "engine_latency_ms": 185.4
 }
 ```
 
-- Common error outputs:
-  - `400`: invalid language names or invalid source/target combination
-  - `400`: GPU id not available
-  - `500`: no GPUs detected
+- Error Payload Format (`400`, `422`, `500`):
+
+```json
+{
+  "status": "error",
+  "detail": "Unsupported language pair: Sanskrit (sa) -> French (fr) on model indictrans2-indic-en-1B"
+}
+```
 
 ### `POST /translate/document`
 
