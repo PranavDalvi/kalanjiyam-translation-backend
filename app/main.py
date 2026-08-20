@@ -33,6 +33,13 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 from transformers import AutoModelForCausalLM, AutoModelForSeq2SeqLM, AutoTokenizer
+import transformers.tokenization_utils
+import transformers.tokenization_utils_base
+
+# Backward compatibility shim for IndicTransToolkit with transformers >= 5.0
+if not hasattr(transformers.tokenization_utils, "PreTrainedTokenizerBase"):
+    transformers.tokenization_utils.PreTrainedTokenizerBase = transformers.tokenization_utils_base.PreTrainedTokenizerBase
+
 from app.glossary import GlossaryService, pre_translate_replace, post_translate_replace
 from app.api_key import verify_api_key_dependency
 
