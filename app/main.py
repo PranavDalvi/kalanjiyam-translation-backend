@@ -40,6 +40,18 @@ import transformers.tokenization_utils_base
 if not hasattr(transformers.tokenization_utils, "PreTrainedTokenizerBase"):
     transformers.tokenization_utils.PreTrainedTokenizerBase = transformers.tokenization_utils_base.PreTrainedTokenizerBase
 
+# Backward compatibility shim for IndicTrans2 dynamic configuration (configuration_indictrans.py)
+if "transformers.onnx" not in sys.modules:
+    onnx_mod = types.ModuleType("transformers.onnx")
+    class OnnxConfig:
+        pass
+    class OnnxSeq2SeqConfigWithPast(OnnxConfig):
+        pass
+    onnx_mod.OnnxConfig = OnnxConfig
+    onnx_mod.OnnxSeq2SeqConfigWithPast = OnnxSeq2SeqConfigWithPast
+    sys.modules["transformers.onnx"] = onnx_mod
+    transformers.onnx = onnx_mod
+
 from app.glossary import GlossaryService, pre_translate_replace, post_translate_replace
 from app.api_key import verify_api_key_dependency
 
