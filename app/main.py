@@ -103,24 +103,32 @@ MODEL_GEMMA_4_12B = "google/gemma-4-12b-it"
 MODEL_CATALOG: Dict[str, Dict[str, object]] = {
     MODEL_EN_INDIC: {
         "key": "en-indic",
+        "engine": "indictrans2",
+        "label": "IndicTrans v2",
         "description": "English to Indic translation model (IndicTrans2)",
         "source_languages": ["English"],
         "target_languages": [lang for lang in LANGUAGES.keys() if lang != "English"],
     },
     MODEL_INDIC_EN: {
         "key": "indic-en",
+        "engine": "indictrans2",
+        "label": "IndicTrans v2",
         "description": "Indic to English translation model (IndicTrans2)",
         "source_languages": [lang for lang in LANGUAGES.keys() if lang != "English"],
         "target_languages": ["English"],
     },
     MODEL_INDIC_INDIC: {
         "key": "indic-indic",
+        "engine": "indictrans2",
+        "label": "IndicTrans v2",
         "description": "Indic to Indic translation model (IndicTrans2)",
         "source_languages": [lang for lang in LANGUAGES.keys() if lang != "English"],
         "target_languages": [lang for lang in LANGUAGES.keys() if lang != "English"],
     },
     MODEL_GEMMA_4_12B: {
         "key": "gemma-4-12b-it",
+        "engine": "gemma",
+        "label": "Gemma 4 12B",
         "description": "Google Gemma 4 12B instruction-tuned multilingual translation model",
         "source_languages": list(LANGUAGES.keys()),
         "target_languages": list(LANGUAGES.keys()),
@@ -466,6 +474,8 @@ class TranslationService:
             {
                 "model_name": model_name,
                 "key": meta["key"],
+                "engine": meta.get("engine", get_engine_identifier(model_name)),
+                "label": meta.get("label", model_name.split("/")[-1].replace("-", " ").title()),
                 "description": meta["description"],
                 "source_languages": meta["source_languages"],
                 "target_languages": meta["target_languages"],
