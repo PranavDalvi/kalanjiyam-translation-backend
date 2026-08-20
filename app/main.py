@@ -71,6 +71,25 @@ if "transformers.onnx" not in sys.modules:
     onnx_mod.utils = onnx_utils_mod
     transformers.onnx = onnx_mod
 
+# Backward compatibility shim for legacy dynamic models with old tie_weights() signature
+import transformers.modeling_utils
+_orig_init_weights = transformers.modeling_utils.PreTrainedModel.init_weights
+
+def _safe_init_weights(self, *args, **kwargs):
+    tie_fn = getattr(self, "tie_weights", None)
+    if callable(tie_fn):
+        try:
+            import inspect
+            sig = inspect.signature(tie_fn)
+            if "recompute_mapping" not in sig.parameters and not any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+                orig_tie = self.tie_weights
+                self.tie_weights = lambda *a, **kw: orig_tie()
+        except Exception:
+            pass
+    return _orig_init_weights(self, *args, **kwargs)
+
+transformers.modeling_utils.PreTrainedModel.init_weights = _safe_init_weights
+
 from app.glossary import GlossaryService, pre_translate_replace, post_translate_replace
 from app.api_key import verify_api_key_dependency
 
