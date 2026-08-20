@@ -184,93 +184,162 @@ def translate(req: TranslateRequest):
     except Exception as e:
         logger.exception(f"Failed to load model: {e}")
         err_msg = str(e)
+
         if "offline" in err_msg.lower() or "local_files" in err_msg.lower():
             raise HTTPException(
                 status_code=503,
-                detail=f"Model not available offline. Run setup_and_run.sh to download. Error: {err_msg}",
+                detail=(
+                    f"Model not available offline. "
+                    f"Run setup_and_run.sh to download. Error: {err_msg}"
+                ),
             )
-        raise HTTPException(status_code=500, detail=f"Failed to load model: {err_msg}")
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to load model: {err_msg}",
+        )
 
     try:
-        lines = req.text.split("\n")
-        translated_lines = []
+        # ---------------------------------------------------------
+        # 1. Preserve the original page line structure
+        # ---------------------------------------------------------
+        line_break_marker = "<LINE_BREAK>"
 
-        for i in range(0, len(lines), req.batch_size):
-            batch = lines[i : i + req.batch_size]
-            valid = [(idx, line) for idx, line in enumerate(batch) if line.strip()]
+        source_text = req.text.replace("\r\n", "\n")
+        source_text = source_text.replace("\n", line_break_marker)
 
-            if not valid:
-                translated_lines.extend(batch)
-                continue
+        # ---------------------------------------------------------
+        # 2. Build the translation instruction
+        # ---------------------------------------------------------
+        user_msg = (
+            f"Translate the following text from "
+            f"{req.source_language} to {req.target_language}.\n\n"
+            "Translate the text faithfully and preserve its meaning.\n"
+            "Do not summarize, explain, interpret, or add information.\n"
+            "Preserve names, places, dates, numbers, and proper nouns "
+            "as accurately as possible.\n"
+            "If the source contains grammatical errors, unusual wording, "
+            "or OCR errors, translate it as faithfully as possible "
+            "without inventing missing information.\n\n"
 
-            results = [""] * len(batch)
-            valid_indices, valid_texts = zip(*valid)
+            "IMPORTANT: Any text enclosed within <dnt> and </dnt> tags "
+            "must NOT be translated or modified in any way. "
+            "Preserve the <dnt> tags and all text inside them exactly as "
+            "they appear in the source.\n\n"
 
-            prompts = []
-            for text_item in valid_texts:
-                user_msg = (
-                    f"Translate the following text from {req.source_language} to {req.target_language}. "
-                    f"Provide only the direct translation without any explanation, notes, or additional commentary:\n\n{text_item}"
+            f"The text contains the special marker {line_break_marker} "
+            "to represent an original line break.\n"
+            f"Preserve every {line_break_marker} marker in the output.\n"
+            f"Do not add, remove, or reorder {line_break_marker} markers.\n\n"
+
+            "Output only the translation. "
+            "Do not include explanations, notes, or commentary.\n\n"
+            f"{source_text}"
+        )
+
+        # ---------------------------------------------------------
+        # 3. Build chat prompt
+        # ---------------------------------------------------------
+        if (
+            hasattr(_tokenizer, "apply_chat_template")
+            and getattr(_tokenizer, "chat_template", None)
+        ):
+            try:
+                prompt = _tokenizer.apply_chat_template(
+                    [{"role": "user", "content": user_msg}],
+                    tokenize=False,
+                    add_generation_prompt=True,
                 )
-                if hasattr(_tokenizer, "apply_chat_template") and getattr(_tokenizer, "chat_template", None):
-                    try:
-                        p = _tokenizer.apply_chat_template(
-                            [{"role": "user", "content": user_msg}],
-                            tokenize=False,
-                            add_generation_prompt=True,
-                        )
-                        prompts.append(p)
-                        continue
-                    except Exception:
-                        pass
-                prompts.append(f"<start_of_turn>user\n{user_msg}<end_of_turn>\n<start_of_turn>model\n")
-
-            inputs = _tokenizer(
-                prompts,
-                truncation=True,
-                padding=True,
-                return_tensors="pt",
+            except Exception:
+                prompt = (
+                    f"<start_of_turn>user\n"
+                    f"{user_msg}"
+                    f"<end_of_turn>\n"
+                    f"<start_of_turn>model\n"
+                )
+        else:
+            prompt = (
+                f"<start_of_turn>user\n"
+                f"{user_msg}"
+                f"<end_of_turn>\n"
+                f"<start_of_turn>model\n"
             )
-            if _device:
-                inputs = inputs.to(_device)
 
-            with torch.no_grad():
-                input_len = inputs.input_ids.shape[1]
-                pad_id = getattr(_tokenizer, "pad_token_id", None) or getattr(_tokenizer, "eos_token_id", None)
-                generated = _model.generate(
-                    **inputs,
-                    max_new_tokens=512,
-                    do_sample=False,
-                    pad_token_id=pad_id,
-                )
-                new_tokens = generated[:, input_len:] if generated.shape[1] >= input_len else generated
-                translations = _tokenizer.batch_decode(
-                    new_tokens.detach().cpu().tolist(),
-                    skip_special_tokens=True,
-                )
+        # ---------------------------------------------------------
+        # 4. Tokenize the complete page
+        # ---------------------------------------------------------
+        inputs = _tokenizer(
+            prompt,
+            truncation=True,
+            padding=True,
+            return_tensors="pt",
+        )
 
-            # Clean up markdown fences
-            cleaned = []
-            for t in translations:
-                t = t.strip()
-                if t.startswith("```") and t.endswith("```"):
-                    lines_t = t.split("\n")
-                    if len(lines_t) > 2:
-                        t = "\n".join(lines_t[1:-1]).strip()
-                cleaned.append(t)
+        if _device:
+            inputs = inputs.to(_device)
 
-            for idx, trans in zip(valid_indices, cleaned):
-                results[idx] = trans
+        # ---------------------------------------------------------
+        # 5. Generate translation
+        # ---------------------------------------------------------
+        with torch.no_grad():
+            input_len = inputs.input_ids.shape[1]
 
-            translated_lines.extend(results)
+            pad_id = (
+                getattr(_tokenizer, "pad_token_id", None)
+                or getattr(_tokenizer, "eos_token_id", None)
+            )
 
-        result_text = "\n".join(translated_lines)
-        return {"text": result_text}
+            generated = _model.generate(
+                **inputs,
+                max_new_tokens=512,
+                do_sample=False,
+                pad_token_id=pad_id,
+            )
+
+            new_tokens = (
+                generated[:, input_len:]
+                if generated.shape[1] >= input_len
+                else generated
+            )
+
+            translation = _tokenizer.decode(
+                new_tokens[0].detach().cpu().tolist(),
+                skip_special_tokens=True,
+            )
+
+        # ---------------------------------------------------------
+        # 6. Clean generated output
+        # ---------------------------------------------------------
+        translation = translation.strip()
+
+        # Remove markdown code fences if the model produces them
+        if translation.startswith("```") and translation.endswith("```"):
+            translation_lines = translation.split("\n")
+
+            if len(translation_lines) > 2:
+                translation = "\n".join(
+                    translation_lines[1:-1]
+                ).strip()
+
+        # ---------------------------------------------------------
+        # 7. Restore original line breaks
+        # ---------------------------------------------------------
+        translation = translation.replace(line_break_marker, "\n")
+
+        return {
+            "text": translation,
+        }
 
     except HTTPException:
         raise
+
     except Exception as e:
         logger.exception(f"Translation failed: {e}")
+
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        raise HTTPException(status_code=500, detail=f"Translation failed: {str(e)}")
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Translation failed: {str(e)}",
+        )
