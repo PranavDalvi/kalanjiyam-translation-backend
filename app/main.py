@@ -43,13 +43,22 @@ if not hasattr(transformers.tokenization_utils, "PreTrainedTokenizerBase"):
 # Backward compatibility shim for IndicTrans2 dynamic configuration (configuration_indictrans.py)
 if "transformers.onnx" not in sys.modules:
     onnx_mod = types.ModuleType("transformers.onnx")
+    onnx_mod.__path__ = []
     class OnnxConfig:
         pass
     class OnnxSeq2SeqConfigWithPast(OnnxConfig):
         pass
     onnx_mod.OnnxConfig = OnnxConfig
     onnx_mod.OnnxSeq2SeqConfigWithPast = OnnxSeq2SeqConfigWithPast
+
+    onnx_utils_mod = types.ModuleType("transformers.onnx.utils")
+    def compute_effective_axis_dimension(*args, **kwargs):
+        return 0
+    onnx_utils_mod.compute_effective_axis_dimension = compute_effective_axis_dimension
+
     sys.modules["transformers.onnx"] = onnx_mod
+    sys.modules["transformers.onnx.utils"] = onnx_utils_mod
+    onnx_mod.utils = onnx_utils_mod
     transformers.onnx = onnx_mod
 
 from app.glossary import GlossaryService, pre_translate_replace, post_translate_replace
