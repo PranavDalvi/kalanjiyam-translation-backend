@@ -43,11 +43,10 @@ if command -v nvidia-smi &> /dev/null; then
 fi
 
 # 4. Ensure Hugging Face cache directory exists on host
-mkdir -p ~/.cache/huggingface
+mkdir -p ~/.cache/huggingface/hub
 
 # 5. Check if models are already cached locally
 OFFLINE_MODE=1
-CACHE_DIR="$HOME/.cache/huggingface/hub/models--ai4bharat--indictrans2-en-indic-1B"
 HF_TOKEN_ENV="${HF_TOKEN:-}"
 
 # Clean HF_TOKEN_ENV by stripping leading/trailing whitespace, quotes, and any "token=" prefix
@@ -55,52 +54,69 @@ if [ -n "$HF_TOKEN_ENV" ]; then
     HF_TOKEN_ENV=$(echo "$HF_TOKEN_ENV" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^["'\''\\]*//' -e 's/["'\''\\]*$//' -e 's/^token=//')
 fi
 
-# Detect if the weights file exists, is not incomplete, and is larger than 10MB
-CACHE_COMPLETE=0
-if [ -d "$CACHE_DIR" ]; then
-    # Follow symlinks (-L) to verify the actual downloaded blob files are >10MB
-    if [ -n "$(find -L "$CACHE_DIR" -type f \( -name "model.safetensors" -o -name "pytorch_model.bin" \) -size +10M 2>/dev/null)" ]; then
-        CACHE_COMPLETE=1
-    fi
-fi
-
-if [ "$CACHE_COMPLETE" -eq 0 ] && [ -d "$CACHE_DIR" ]; then
-    echo "---------------------------------------------------------"
-    echo "WARNING: An incomplete or corrupted cache directory was detected at:"
-    echo "  $CACHE_DIR"
-    echo "To avoid download/resume issues, it is recommended to clean this directory."
-    echo "---------------------------------------------------------"
-    if [ -t 0 ]; then
-        read -rp "Would you like to delete the incomplete cache and start fresh? (y/N): " clean_choice
-        if [[ "$clean_choice" =~ ^[Yy]$ ]]; then
-            echo "Cleaning cache directory..."
-            rm -rf "$CACHE_DIR"
+# Function to check if a specific model directory has valid complete weights (>10MB)
+is_model_cached() {
+    local target_dir="$1"
+    if [ -d "$target_dir" ]; then
+        if [ -n "$(find -L "$target_dir" -type f \( -name "*.safetensors" -o -name "*.bin" \) -size +10M 2>/dev/null)" ]; then
+            return 0
         fi
-    else
-        echo "Non-interactive shell detected. Retaining existing cache directory for resume attempt."
     fi
+    return 1
+}
+
+GEMMA_CACHE_DIR="$HOME/.cache/huggingface/hub/models--google--gemma-4-12b-it"
+GEMMA_ALT_CACHE_DIR="$HOME/.cache/huggingface/hub/models--google--gemma-4-12B-it"
+INDICTRANS_EN_INDIC="$HOME/.cache/huggingface/hub/models--ai4bharat--indictrans2-en-indic-1B"
+
+GEMMA_CACHED=0
+if is_model_cached "$GEMMA_CACHE_DIR" || is_model_cached "$GEMMA_ALT_CACHE_DIR"; then
+    GEMMA_CACHED=1
 fi
 
-if [ "$CACHE_COMPLETE" -eq 0 ]; then
-    echo "---------------------------------------------------------"
+INDICTRANS_CACHED=0
+if is_model_cached "$INDICTRANS_EN_INDIC"; then
+    INDICTRANS_CACHED=1
+fi
+
+echo "---------------------------------------------------------"
+echo "Model Cache Status on Host (~/.cache/huggingface):"
+if [ "$GEMMA_CACHED" -eq 1 ]; then
+    echo "  [✓] Google Gemma 4 12B (google/gemma-4-12b-it): Cached"
+else
+    echo "  [ ] Google Gemma 4 12B (google/gemma-4-12b-it): Not cached"
+fi
+
+if [ "$INDICTRANS_CACHED" -eq 1 ]; then
+    echo "  [✓] IndicTrans2 En->Indic (ai4bharat/indictrans2-en-indic-1B): Cached"
+else
+    echo "  [ ] IndicTrans2 En->Indic (ai4bharat/indictrans2-en-indic-1B): Not cached"
+fi
+echo "---------------------------------------------------------"
+
+if [ "$GEMMA_CACHED" -eq 0 ] && [ "$INDICTRANS_CACHED" -eq 0 ]; then
     echo "Hugging Face model access authentication:"
-    echo "No cached models found or cache is incomplete. Running in online mode to download them."
-    echo "IndicTrans2 models are gated on Hugging Face. If they are not already cached"
-    echo "locally, please accept the license terms at:"
-    echo "  https://huggingface.co/ai4bharat/indictrans2-en-indic-1B"
-    echo "and generate a read access token at https://huggingface.co/settings/tokens."
+    echo "No cached models found. Running in online mode to download them on first request."
+    echo "Gemma 4 and IndicTrans2 models are gated on Hugging Face. Please accept license terms at:"
+    echo "  - https://huggingface.co/google/gemma-4-12b-it"
+    echo "  - https://huggingface.co/ai4bharat/indictrans2-en-indic-1B"
+    echo "and generate an access token at: https://huggingface.co/settings/tokens"
     echo "---------------------------------------------------------"
     if [ -z "$HF_TOKEN_ENV" ]; then
         read -rp "Enter your Hugging Face Access Token (press Enter to skip): " input_token
-        # Clean input_token too
         input_token=$(echo "$input_token" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^["'\''\\]*//' -e 's/["'\''\\]*$//' -e 's/^token=//')
         HF_TOKEN_ENV="$input_token"
     fi
     OFFLINE_MODE=0
 else
-    echo "---------------------------------------------------------"
     echo "STATUS: Cached translation models detected."
-    echo "Action: Running in strict offline mode (no token/network required)."
+    if [ -n "$HF_TOKEN_ENV" ]; then
+        echo "Action: Hugging Face token provided. Online downloads enabled for any uncached models."
+        OFFLINE_MODE=0
+    else
+        echo "Action: Running in offline mode using host cache."
+        OFFLINE_MODE=1
+    fi
     echo "---------------------------------------------------------"
 fi
 
