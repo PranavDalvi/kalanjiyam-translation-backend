@@ -32,87 +32,8 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile, BackgroundTa
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
-from transformers import AutoModelForCausalLM, AutoModelForSeq2SeqLM, AutoTokenizer
-import transformers.tokenization_utils
-import transformers.tokenization_utils_base
-
-# Backward compatibility shim for IndicTransToolkit with transformers >= 5.0
-if not hasattr(transformers.tokenization_utils, "PreTrainedTokenizerBase"):
-    transformers.tokenization_utils.PreTrainedTokenizerBase = transformers.tokenization_utils_base.PreTrainedTokenizerBase
-
-# Backward compatibility shim for IndicTransTokenizer setting special tokens before __init__
-_orig_tokenizer_setattr = transformers.tokenization_utils_base.PreTrainedTokenizerBase.__setattr__
-
-def _safe_tokenizer_setattr(self, name, value):
-    if "_special_tokens_map" not in self.__dict__ and not hasattr(self, "_special_tokens_map"):
-        object.__setattr__(self, "_special_tokens_map", {})
-    return _orig_tokenizer_setattr(self, name, value)
-
-transformers.tokenization_utils_base.PreTrainedTokenizerBase.__setattr__ = _safe_tokenizer_setattr
-
-# Backward compatibility shim for IndicTrans2 dynamic configuration (configuration_indictrans.py)
-if "transformers.onnx" not in sys.modules:
-    onnx_mod = types.ModuleType("transformers.onnx")
-    onnx_mod.__path__ = []
-    class OnnxConfig:
-        pass
-    class OnnxSeq2SeqConfigWithPast(OnnxConfig):
-        pass
-    onnx_mod.OnnxConfig = OnnxConfig
-    onnx_mod.OnnxSeq2SeqConfigWithPast = OnnxSeq2SeqConfigWithPast
-
-    onnx_utils_mod = types.ModuleType("transformers.onnx.utils")
-    def compute_effective_axis_dimension(*args, **kwargs):
-        return 0
-    onnx_utils_mod.compute_effective_axis_dimension = compute_effective_axis_dimension
-
-    sys.modules["transformers.onnx"] = onnx_mod
-    sys.modules["transformers.onnx.utils"] = onnx_utils_mod
-    onnx_mod.utils = onnx_utils_mod
-    transformers.onnx = onnx_mod
-
-# Backward compatibility shim for legacy dynamic models with old tie_weights() signature
-import transformers.modeling_utils
-_orig_init_weights = transformers.modeling_utils.PreTrainedModel.init_weights
-
-def _safe_init_weights(self, *args, **kwargs):
-    tie_fn = getattr(self, "tie_weights", None)
-    if callable(tie_fn):
-        try:
-            import inspect
-            sig = inspect.signature(tie_fn)
-            if "recompute_mapping" not in sig.parameters and not any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
-                orig_tie = self.tie_weights
-                self.tie_weights = lambda *a, **kw: orig_tie()
-        except Exception:
-            pass
-    return _orig_init_weights(self, *args, **kwargs)
-
-transformers.modeling_utils.PreTrainedModel.init_weights = _safe_init_weights
-
-# Backward compatibility shim for legacy Seq2Seq models indexing past_key_values / EncoderDecoderCache
-import transformers.cache_utils
-
-if hasattr(transformers.cache_utils, "DynamicCache"):
-    def _dynamic_cache_getitem(self, layer_idx):
-        if hasattr(self, "layers") and layer_idx < len(self.layers):
-            layer = self.layers[layer_idx]
-            return (getattr(layer, "keys", None), getattr(layer, "values", None))
-        raise IndexError(f"DynamicCache index {layer_idx} out of range")
-    transformers.cache_utils.DynamicCache.__getitem__ = _dynamic_cache_getitem
-    transformers.cache_utils.DynamicCache.__len__ = lambda self: len(self.layers) if hasattr(self, "layers") else 0
-
-if hasattr(transformers.cache_utils, "EncoderDecoderCache"):
-    def _enc_dec_cache_getitem(self, layer_idx):
-        self_kv = self.self_attention_cache[layer_idx] if hasattr(self, "self_attention_cache") and layer_idx < len(self.self_attention_cache) else (None, None)
-        cross_kv = self.cross_attention_cache[layer_idx] if hasattr(self, "cross_attention_cache") and layer_idx < len(self.cross_attention_cache) else (None, None)
-        return (self_kv[0], self_kv[1], cross_kv[0], cross_kv[1])
-    transformers.cache_utils.EncoderDecoderCache.__getitem__ = _enc_dec_cache_getitem
-    transformers.cache_utils.EncoderDecoderCache.__len__ = lambda self: max(
-        len(self.self_attention_cache) if hasattr(self, "self_attention_cache") else 0,
-        len(self.cross_attention_cache) if hasattr(self, "cross_attention_cache") else 0
-    )
-
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+import httpx
 from app.glossary import GlossaryService, pre_translate_replace, post_translate_replace
 from app.api_key import verify_api_key_dependency
 
@@ -123,6 +44,9 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 os.environ.setdefault("GRADIO_TEMP_DIR", os.path.join(os.getcwd(), "gradio_temp"))
 os.makedirs(os.environ["GRADIO_TEMP_DIR"], exist_ok=True)
+
+# Gemma 4 sidecar service URL (Docker Compose internal network)
+GEMMA_SIDECAR_URL = os.environ.get("GEMMA_SIDECAR_URL", "http://gemma-worker:8889")
 
 LANGUAGE_INFO: Dict[str, Tuple[str, str]] = {
     "English": ("eng_Latn", "en"),
@@ -461,91 +385,11 @@ class TranslationService:
                         else:
                             raise e
                 else:
-                    # Gemma / Causal LM model loading
-                    ip = None
-                    tokenizer = AutoTokenizer.from_pretrained(
-                        model_name,
-                        trust_remote_code=True,
-                        local_files_only=offline_mode,
-                        token=hf_token,
+                    # Non-IndicTrans models (e.g. Gemma) are handled by dedicated sidecar services
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Model {model_name} is not an IndicTrans model. Gemma translations are handled by the gemma-worker sidecar service."
                     )
-                    if tokenizer.pad_token is None:
-                        tokenizer.pad_token = tokenizer.eos_token
-                    tokenizer.padding_side = "left"
-
-                    if use_cuda:
-                        dtype = torch.bfloat16 if (hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported()) else torch.float16
-                    else:
-                        dtype = torch.float32
-
-                    try:
-                        if use_cuda:
-                            torch.cuda.set_device(gpu_id)
-                            try:
-                                model = AutoModelForCausalLM.from_pretrained(
-                                    model_name,
-                                    trust_remote_code=True,
-                                    torch_dtype=dtype,
-                                    device_map={"": device},
-                                    local_files_only=offline_mode,
-                                    token=hf_token,
-                                )
-                            except Exception:
-                                model = AutoModelForCausalLM.from_pretrained(
-                                    model_name,
-                                    trust_remote_code=True,
-                                    torch_dtype=dtype,
-                                    local_files_only=offline_mode,
-                                    token=hf_token,
-                                ).to(device)
-                        else:
-                            try:
-                                model = AutoModelForCausalLM.from_pretrained(
-                                    model_name,
-                                    trust_remote_code=True,
-                                    torch_dtype=dtype,
-                                    local_files_only=offline_mode,
-                                    token=hf_token,
-                                ).to(device)
-                            except Exception:
-                                model = AutoModelForSeq2SeqLM.from_pretrained(
-                                    model_name,
-                                    trust_remote_code=True,
-                                    torch_dtype=dtype,
-                                    local_files_only=offline_mode,
-                                    token=hf_token,
-                                ).to(device)
-                        model.eval()
-                    except Exception as e:
-                        if use_cuda:
-                            logger.warning(f"Failed to load Gemma model on GPU: {e}. Retrying CPU fallback.")
-                            device = "cpu"
-                            use_cuda = False
-                            cache_key = (device, model_key)
-                            if cache_key in self.loaded_models:
-                                bundle = self.loaded_models[cache_key]
-                                self.last_used[cache_key] = time.time()
-                                return bundle["model"], bundle["tokenizer"], bundle.get("ip")
-
-                            try:
-                                model = AutoModelForCausalLM.from_pretrained(
-                                    model_name,
-                                    trust_remote_code=True,
-                                    torch_dtype=torch.float32,
-                                    local_files_only=offline_mode,
-                                    token=hf_token,
-                                ).to(device)
-                            except Exception:
-                                model = AutoModelForSeq2SeqLM.from_pretrained(
-                                    model_name,
-                                    trust_remote_code=True,
-                                    torch_dtype=torch.float32,
-                                    local_files_only=offline_mode,
-                                    token=hf_token,
-                                ).to(device)
-                            model.eval()
-                        else:
-                            raise e
             finally:
                 self.active_downloads.discard(model_name)
 
@@ -656,23 +500,13 @@ class TranslationService:
                                 inputs = inputs.to(model_device)
 
                             with torch.no_grad():
-                                try:
-                                    generated_tokens = model.generate(
-                                        **inputs,
-                                        use_cache=False,
-                                        min_length=0,
-                                        max_length=512,
-                                        num_beams=4,
-                                        early_stopping=True,
-                                    )
-                                except Exception:
-                                    generated_tokens = model.generate(
-                                        **inputs,
-                                        min_length=0,
-                                        max_length=512,
-                                        num_beams=4,
-                                        early_stopping=True,
-                                    )
+                                generated_tokens = model.generate(
+                                    **inputs,
+                                    min_length=0,
+                                    max_length=512,
+                                    num_beams=4,
+                                    early_stopping=True,
+                                )
 
                             translations = tokenizer.batch_decode(
                                 generated_tokens.detach().cpu().tolist(),
@@ -944,7 +778,43 @@ def list_glossaries() -> List[Dict[str, str]]:
     return available
 
 
-@app.post("/translate/text", dependencies=[Depends(verify_api_key_dependency)])
+def _proxy_gemma_translation(
+    text: str,
+    src_name: str,
+    tgt_name: str,
+    gpu_id: int = 0,
+    batch_size: int = 4,
+) -> str:
+    """Proxy translation request to the isolated Gemma 4 sidecar container."""
+    try:
+        with httpx.Client(timeout=300.0) as client:
+            resp = client.post(
+                f"{GEMMA_SIDECAR_URL}/translate",
+                json={
+                    "text": text,
+                    "source_language": src_name,
+                    "target_language": tgt_name,
+                    "gpu_id": gpu_id,
+                    "batch_size": batch_size,
+                },
+            )
+            if resp.status_code != 200:
+                detail = resp.json().get("detail", resp.text) if resp.headers.get("content-type", "").startswith("application/json") else resp.text
+                raise HTTPException(status_code=resp.status_code, detail=f"Gemma sidecar error: {detail}")
+            return resp.json()["text"]
+    except httpx.ConnectError:
+        raise HTTPException(
+            status_code=503,
+            detail="Gemma translation service is not available. Make sure the gemma-worker container is running."
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Gemma sidecar proxy failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Gemma translation failed: {str(e)}")
+
+
+@app.post("/translate/text", response_model=TranslateTextResponse, dependencies=[Depends(verify_api_key_dependency)])
 @app.post("/v1/translate", dependencies=[Depends(verify_api_key_dependency)])
 def translate_text(payload: TranslateTextRequest) -> TranslateTextResponse:
     logger.info(
@@ -994,6 +864,51 @@ def translate_text(payload: TranslateTextRequest) -> TranslateTextResponse:
 
     start_time = time.perf_counter()
 
+    # Check if this model should be proxied to the Gemma sidecar
+    model_meta = MODEL_CATALOG.get(model_name, {})
+    if model_meta.get("engine") == "gemma":
+        translated_text = _proxy_gemma_translation(
+            payload.text,
+            src_name,
+            tgt_name,
+            payload.gpu_id,
+            payload.batch_size,
+        )
+
+        # Post-process glossary replacement if needed
+        if payload.glossary:
+            glossary_dict = glossary_service.get_merged_glossary_dict(
+                payload.glossary, src_name, tgt_name
+            )
+            if glossary_dict and "<dnt>" in translated_text:
+                _, mapping = pre_translate_replace(payload.text, glossary_dict)
+                if mapping:
+                    translated_text = post_translate_replace(translated_text, mapping)
+
+        end_time = time.perf_counter()
+        latency_ms = round((end_time - start_time) * 1000.0, 2)
+        engine_name = get_engine_identifier(model_name)
+
+        logger.info(
+            f"Outgoing Text Response (Gemma sidecar): engine={engine_name}, model={model_name}, "
+            f"src={src_iso}, tgt={tgt_iso}, text_length={len(translated_text)} chars, latency={latency_ms}ms"
+        )
+
+        return TranslateTextResponse(
+            status="success",
+            engine=engine_name,
+            model=ModelIdentity(name=model_name, version="1.0"),
+            source_language=src_iso,
+            target_language=tgt_iso,
+            text=translated_text,
+            translated_text=translated_text,
+            confidence=0.965,
+            input_chars=len(payload.text),
+            output_chars=len(translated_text),
+            engine_latency_ms=latency_ms,
+        )
+
+    # IndicTrans2 local model loading and translation
     with translation_semaphore:
         try:
             model, tokenizer, ip = service.get_translation_model(
@@ -1118,22 +1033,28 @@ def translate_document(
                 model_name = cat_name
                 break
 
+    model_meta = MODEL_CATALOG.get(model_name, {})
+    is_gemma = model_meta.get("engine") == "gemma"
+
     with translation_semaphore:
-        try:
-            model, tokenizer, ip = service.get_translation_model(model_name, src_name, tgt_name, gpu_id)
-        except HTTPException as he:
-            raise he
-        except Exception as e:
-            err_msg = str(e)
-            if "offline" in err_msg.lower() or "local_files" in err_msg.lower() or "does not appear to have a file named" in err_msg.lower():
+        if not is_gemma:
+            try:
+                model, tokenizer, ip = service.get_translation_model(model_name, src_name, tgt_name, gpu_id)
+            except HTTPException as he:
+                raise he
+            except Exception as e:
+                err_msg = str(e)
+                if "offline" in err_msg.lower() or "local_files" in err_msg.lower() or "does not appear to have a file named" in err_msg.lower():
+                    raise HTTPException(
+                        status_code=503,
+                        detail=f"Translation model failed to load. The local cache is likely incomplete or corrupted. Try running './setup_and_run.sh' to download/repair the cache. Error: {err_msg}"
+                    )
                 raise HTTPException(
-                    status_code=503,
-                    detail=f"Translation model failed to load. The local cache is likely incomplete or corrupted. Try running './setup_and_run.sh' to download/repair the cache. Error: {err_msg}"
+                    status_code=500,
+                    detail=f"Failed to load translation model: {err_msg}"
                 )
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to load translation model: {err_msg}"
-            )
+        else:
+            model, tokenizer, ip = None, None, None
 
         # Load glossary mapping if requested
         glossary_dict = None
@@ -1158,8 +1079,32 @@ def translate_document(
                     handle.write(content)
 
                 if ext == ".docx":
-                    doc = service.process_docx(input_path, model, tokenizer, ip, src_name, tgt_name, batch_size, glossary_dict)
-                    doc.save(output_path)
+                    if is_gemma:
+                        doc = Document(input_path)
+                        paras = [p.text for p in doc.paragraphs]
+                        valid_paras = [p for p in paras if p.strip()]
+                        if valid_paras:
+                            translated_block = _proxy_gemma_translation(
+                                "\n".join(valid_paras),
+                                src_name,
+                                tgt_name,
+                                gpu_id=gpu_id,
+                                batch_size=batch_size,
+                            )
+                            trans_lines = iter(translated_block.split("\n"))
+                            for p in doc.paragraphs:
+                                if p.text.strip():
+                                    t = next(trans_lines, "")
+                                    for r in p.runs:
+                                        r.text = ""
+                                    if p.runs:
+                                        p.runs[0].text = t
+                                    else:
+                                        p.add_run(t)
+                        doc.save(output_path)
+                    else:
+                        doc = service.process_docx(input_path, model, tokenizer, ip, src_name, tgt_name, batch_size, glossary_dict)
+                        doc.save(output_path)
 
                 elif ext == ".pdf":
                     text_list: List[str] = []
@@ -1169,16 +1114,26 @@ def translate_document(
                             if page_text:
                                 text_list.append(page_text)
                     full_text = "\n".join(text_list)
-                    translated = service.translate_batch_memory_safe(
-                        full_text.split("\n"),
-                        model,
-                        tokenizer,
-                        ip,
-                        src_name,
-                        tgt_name,
-                        batch_size=batch_size,
-                        glossary_dict=glossary_dict,
-                    )
+                    if is_gemma:
+                        translated_block = _proxy_gemma_translation(
+                            full_text,
+                            src_name,
+                            tgt_name,
+                            gpu_id=gpu_id,
+                            batch_size=batch_size,
+                        )
+                        translated = translated_block.split("\n")
+                    else:
+                        translated = service.translate_batch_memory_safe(
+                            full_text.split("\n"),
+                            model,
+                            tokenizer,
+                            ip,
+                            src_name,
+                            tgt_name,
+                            batch_size=batch_size,
+                            glossary_dict=glossary_dict,
+                        )
                     doc = Document()
                     for line in translated:
                         doc.add_paragraph(line)
@@ -1187,16 +1142,26 @@ def translate_document(
                 else:  # .txt
                     with open(input_path, "r", encoding="utf-8") as handle:
                         lines = [line.strip() for line in handle.readlines() if line.strip()]
-                    translated = service.translate_batch_memory_safe(
-                        lines,
-                        model,
-                        tokenizer,
-                        ip,
-                        src_name,
-                        tgt_name,
-                        batch_size=batch_size,
-                        glossary_dict=glossary_dict,
-                    )
+                    if is_gemma:
+                        translated_block = _proxy_gemma_translation(
+                            "\n".join(lines),
+                            src_name,
+                            tgt_name,
+                            gpu_id=gpu_id,
+                            batch_size=batch_size,
+                        )
+                        translated = translated_block.split("\n")
+                    else:
+                        translated = service.translate_batch_memory_safe(
+                            lines,
+                            model,
+                            tokenizer,
+                            ip,
+                            src_name,
+                            tgt_name,
+                            batch_size=batch_size,
+                            glossary_dict=glossary_dict,
+                        )
                     doc = Document()
                     for line in translated:
                         doc.add_paragraph(line)

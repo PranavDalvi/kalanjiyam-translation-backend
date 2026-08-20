@@ -24,9 +24,10 @@ if ! command -v docker &> /dev/null; then
     exit 1
 fi
 
-# 2. Build the Docker Image
-echo "Building the Docker image..."
+# 2. Build the Docker Images
+echo "Building Docker images..."
 docker build -t kalanjiyam-translation .
+docker build -t kalanjiyam-gemma-worker ./gemma_service
 
 # 3. Check GPU Availability
 echo "Checking GPU availability..."
@@ -146,17 +147,21 @@ if [ "$HAS_GPU" = true ]; then
     
     # Try using docker compose (v2) or fallback to docker-compose (v1)
     if docker compose version &> /dev/null; then
-        docker rm -f kalanjiyam-translation-api 2>/dev/null || true
+        docker rm -f kalanjiyam-translation-api kalanjiyam-gemma-worker 2>/dev/null || true
         docker compose down --remove-orphans || true
         GLOSSARIES_DIR="$GLOSSARIES_DIR_VAL" HF_TOKEN="$HF_TOKEN_ENV" TRANSFORMERS_OFFLINE="$OFFLINE_MODE" HF_HUB_OFFLINE="$OFFLINE_MODE" MAX_CONCURRENT_TRANSLATIONS="$MAX_CONCURRENT_TRANSLATIONS_VAL" AUTO_SELECT_GPU="$AUTO_SELECT_GPU_VAL" ENABLE_API_KEY_AUTH="$ENABLE_API_KEY_AUTH_VAL" API_KEY_DB_PATH="api_keys.db" docker compose up -d --build
-        echo "Service is running on http://localhost:8888"
+        echo "Services are running:"
+        echo "  - Main API (IndicTrans2): http://localhost:8888"
+        echo "  - Gemma 4 Sidecar:       http://localhost:8889"
         echo "To view logs, run: docker compose logs -f"
 
     elif command -v docker-compose &> /dev/null; then
-        docker rm -f kalanjiyam-translation-api 2>/dev/null || true
+        docker rm -f kalanjiyam-translation-api kalanjiyam-gemma-worker 2>/dev/null || true
         docker-compose down --remove-orphans || true
         GLOSSARIES_DIR="$GLOSSARIES_DIR_VAL" HF_TOKEN="$HF_TOKEN_ENV" TRANSFORMERS_OFFLINE="$OFFLINE_MODE" HF_HUB_OFFLINE="$OFFLINE_MODE" MAX_CONCURRENT_TRANSLATIONS="$MAX_CONCURRENT_TRANSLATIONS_VAL" AUTO_SELECT_GPU="$AUTO_SELECT_GPU_VAL" ENABLE_API_KEY_AUTH="$ENABLE_API_KEY_AUTH_VAL" API_KEY_DB_PATH="api_keys.db" docker-compose up -d --build
-        echo "Service is running on http://localhost:8888"
+        echo "Services are running:"
+        echo "  - Main API (IndicTrans2): http://localhost:8888"
+        echo "  - Gemma 4 Sidecar:       http://localhost:8889"
         echo "To view logs, run: docker-compose logs -f"
     else
         echo "Warning: docker-compose command not found. Running with direct docker command..."

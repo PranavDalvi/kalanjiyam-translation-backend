@@ -8,7 +8,6 @@ services:
       - ~/.cache/huggingface:/root/.cache/huggingface
       - ${GLOSSARIES_DIR:-./glossaries}:/app/glossaries
       - ./api_keys.db:/app/api_keys.db
-
     environment:
       - TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-1}
       - HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
@@ -18,7 +17,9 @@ services:
       - AUTO_SELECT_GPU=${AUTO_SELECT_GPU:-1}
       - ENABLE_API_KEY_AUTH=${ENABLE_API_KEY_AUTH:-0}
       - API_KEY_DB_PATH=api_keys.db
-
+      - GEMMA_SIDECAR_URL=http://gemma-worker:8889
+    depends_on:
+      - gemma-worker
     deploy:
       resources:
         reservations:
@@ -27,3 +28,25 @@ services:
               count: all
               capabilities: [gpu]
     restart: always
+
+  gemma-worker:
+    build: ./gemma_service
+    container_name: kalanjiyam-gemma-worker
+    ports:
+      - "8889:8889"
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    environment:
+      - TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-1}
+      - HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
+      - HF_TOKEN=${HF_TOKEN:-}
+      - AUTO_SELECT_GPU=${AUTO_SELECT_GPU:-1}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: always
+

@@ -167,23 +167,26 @@ def test_translate_text_endpoint_gemma_4_12b(monkeypatch) -> None:
         assert tgt_lang_name == "Tamil"
         return object(), object(), None
 
-    def fake_translate_batch_memory_safe(
-        sentences,
-        model,
-        tokenizer,
-        ip,
-        src_lang,
-        tgt_lang,
-        batch_size,
-        **kwargs
-    ):
-        assert ip is None
-        assert src_lang in ("English", "eng_Latn")
-        assert tgt_lang in ("Tamil", "tam_Taml")
-        return ["வணக்கம் உலகம்"]
+    class FakeResponse:
+        status_code = 200
+        headers = {"content-type": "application/json"}
+        def json(self):
+            return {"text": "வணக்கம் உலகம்"}
 
-    monkeypatch.setattr(main.service, "get_translation_model", fake_get_translation_model)
-    monkeypatch.setattr(main.service, "translate_batch_memory_safe", fake_translate_batch_memory_safe)
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def post(self, url, json=None, **kwargs):
+            assert "/translate" in url
+            assert json["source_language"] == "English"
+            assert json["target_language"] == "Tamil"
+            return FakeResponse()
+
+    monkeypatch.setattr("httpx.Client", FakeClient)
 
     response = client.post(
         "/translate/text",
@@ -208,17 +211,26 @@ def test_translate_text_endpoint_gemma_4_12b(monkeypatch) -> None:
 
 
 def test_gemma_model_alias_resolution(monkeypatch) -> None:
-    resolved_models = []
+    called_urls = []
 
-    def fake_get_translation_model(model_name: str, src_lang_name: str, tgt_lang_name: str, gpu_id: int):
-        resolved_models.append(model_name)
-        return object(), object(), None
+    class FakeResponse:
+        status_code = 200
+        headers = {"content-type": "application/json"}
+        def json(self):
+            return {"text": "மொழிபெயர்ப்பு"}
 
-    def fake_translate_batch_memory_safe(sentences, model, tokenizer, ip, src_lang, tgt_lang, batch_size, **kwargs):
-        return ["மொழிபெயர்ப்பு"]
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def post(self, url, json=None, **kwargs):
+            called_urls.append(url)
+            return FakeResponse()
 
-    monkeypatch.setattr(main.service, "get_translation_model", fake_get_translation_model)
-    monkeypatch.setattr(main.service, "translate_batch_memory_safe", fake_translate_batch_memory_safe)
+    monkeypatch.setattr("httpx.Client", FakeClient)
 
     for alias in ["gemma-4-12b", "gemma 4 12b", "google/gemma-4-12B-it", "gemma4-12b-it"]:
         response = client.post(
@@ -233,7 +245,7 @@ def test_gemma_model_alias_resolution(monkeypatch) -> None:
         assert response.status_code == 200
         assert response.json()["engine"] == "gemma"
 
-    assert all(m == "google/gemma-4-12b-it" for m in resolved_models)
+    assert len(called_urls) == 4
 
 
 def test_translate_batch_memory_safe_gemma_logic() -> None:

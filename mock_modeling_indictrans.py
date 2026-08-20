@@ -1,4 +1,4 @@
 
 class IndicTransForConditionalGeneration:
-    def tie_weights(self, *args, **kwargs):
+    def tie_weights(self):
         print("Original tie_weights called")
