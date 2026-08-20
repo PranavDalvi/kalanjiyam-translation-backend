@@ -1,5 +1,6 @@
 import io
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -217,6 +218,155 @@ class TranslateTextResponse(BaseModel):
     input_chars: Optional[int] = None
     output_chars: Optional[int] = None
     engine_latency_ms: float
+
+
+def chunk_for_indictrans(
+    text: str,
+    tokenizer: Optional[AutoTokenizer] = None,
+    max_tokens: int = 256,
+) -> List[str]:
+    """
+    Groups raw text into logical translation chunks for IndicTrans2.
+
+    Key behaviors:
+    1. Normalizes line endings (\\r\\n -> \\n).
+    2. Identifies paragraph boundaries (\\n\\s*\\n+).
+    3. Within each paragraph, joins consecutive physical lines with spaces
+       so that soft line wraps do not fragment sentences.
+    4. Ensures no chunk exceeds max_tokens according to the tokenizer.
+    5. If a paragraph exceeds max_tokens, splits at sentence boundaries (.?!।॥)
+       or clause / word boundaries while preserving original order.
+    6. Returns non-empty chunks in original sequence.
+    """
+    if not text or not text.strip():
+        return []
+
+    # 1. Normalize line endings
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    # Helper for token counting
+    def _count_tokens(s: str) -> int:
+        if not s:
+            return 0
+        if tokenizer is not None:
+            try:
+                if hasattr(tokenizer, "encode"):
+                    return len(tokenizer.encode(s, add_special_tokens=False))
+                elif callable(tokenizer):
+                    res = tokenizer(s, add_special_tokens=False)
+                    if hasattr(res, "input_ids"):
+                        return len(res.input_ids)
+                    elif isinstance(res, dict) and "input_ids" in res:
+                        return len(res["input_ids"])
+            except Exception:
+                pass
+        # Fallback approximation (~1.3 tokens per word)
+        return max(1, len(s.split()))
+
+    # 2. Split into logical paragraphs
+    raw_paragraphs = re.split(r'\n\s*\n+', normalized)
+    chunks: List[str] = []
+
+    for raw_p in raw_paragraphs:
+        if not raw_p.strip():
+            continue
+
+        # 3. Unwrap physical lines inside this paragraph into continuous prose
+        lines = [l.strip() for l in raw_p.split("\n") if l.strip()]
+        if not lines:
+            continue
+        para_text = " ".join(lines)
+        # Collapse multiple consecutive whitespace/tabs into single space
+        para_text = re.sub(r'[ \t]+', ' ', para_text).strip()
+        if not para_text:
+            continue
+
+        # 4. Check token length of paragraph
+        if _count_tokens(para_text) <= max_tokens:
+            chunks.append(para_text)
+            continue
+
+        # 5. Paragraph is too large -> split into sentences (.?! or Indic dandas ।॥)
+        sentences = re.split(r'(?<=[.?!।॥])\s+', para_text)
+        sentences = [s.strip() for s in sentences if s.strip()]
+
+        current_chunk: List[str] = []
+        current_tokens = 0
+
+        for s in sentences:
+            s_tokens = _count_tokens(s)
+
+            if s_tokens > max_tokens:
+                # Flush existing buffer
+                if current_chunk:
+                    chunks.append(" ".join(current_chunk))
+                    current_chunk = []
+                    current_tokens = 0
+
+                # Split oversized sentence by secondary punctuation (; , : - – —)
+                sub_parts = re.split(r'(?<=[,;:\-–—])\s+', s)
+                sub_parts = [p.strip() for p in sub_parts if p.strip()]
+
+                sub_chunk: List[str] = []
+                sub_tokens = 0
+
+                for sp in sub_parts:
+                    sp_tokens = _count_tokens(sp)
+                    if sp_tokens > max_tokens:
+                        # Flush existing sub_chunk
+                        if sub_chunk:
+                            chunks.append(" ".join(sub_chunk))
+                            sub_chunk = []
+                            sub_tokens = 0
+
+                        # Split by words
+                        words = sp.split()
+                        word_chunk: List[str] = []
+                        word_tokens = 0
+                        for w in words:
+                            w_tok = _count_tokens(w)
+                            if w_tok > max_tokens:
+                                # Extremely long un-spaced string: hard slice
+                                if word_chunk:
+                                    chunks.append(" ".join(word_chunk))
+                                    word_chunk = []
+                                    word_tokens = 0
+                                slice_size = max_tokens * 3
+                                for start in range(0, len(w), slice_size):
+                                    chunks.append(w[start : start + slice_size])
+                            elif word_tokens + w_tok <= max_tokens:
+                                word_chunk.append(w)
+                                word_tokens += w_tok
+                            else:
+                                chunks.append(" ".join(word_chunk))
+                                word_chunk = [w]
+                                word_tokens = w_tok
+                        if word_chunk:
+                            chunks.append(" ".join(word_chunk))
+                    elif sub_tokens + sp_tokens <= max_tokens:
+                        sub_chunk.append(sp)
+                        sub_tokens += sp_tokens
+                    else:
+                        chunks.append(" ".join(sub_chunk))
+                        sub_chunk = [sp]
+                        sub_tokens = sp_tokens
+
+                if sub_chunk:
+                    chunks.append(" ".join(sub_chunk))
+
+            else:
+                candidate = " ".join(current_chunk + [s]) if current_chunk else s
+                if _count_tokens(candidate) <= max_tokens:
+                    current_chunk.append(s)
+                else:
+                    if current_chunk:
+                        chunks.append(" ".join(current_chunk))
+                    current_chunk = [s]
+
+        if current_chunk:
+            chunks.append(" ".join(current_chunk))
+
+    return chunks
 
 
 class TranslationService:
@@ -619,45 +769,65 @@ class TranslationService:
     ) -> Document:
         doc = Document(file_path)
 
-        paras_text = [p.text for p in doc.paragraphs]
-        translated_paras = self.translate_batch_memory_safe(
-            paras_text,
-            model,
-            tokenizer,
-            ip,
-            src_lang,
-            tgt_lang,
-            batch_size=batch_size,
-            glossary_dict=glossary_dict,
-        )
+        para_mapping = []  # (p_idx, start_chunk_idx, end_chunk_idx)
+        all_chunks = []
 
         for i, paragraph in enumerate(doc.paragraphs):
-            if paragraph.text.strip():
+            p_text = paragraph.text
+            if not p_text.strip():
+                continue
+            chunks = chunk_for_indictrans(p_text, tokenizer=tokenizer, max_tokens=256)
+            if not chunks:
+                continue
+            start_idx = len(all_chunks)
+            all_chunks.extend(chunks)
+            end_idx = len(all_chunks)
+            para_mapping.append((i, start_idx, end_idx))
+
+        if all_chunks:
+            translated_chunks = self.translate_batch_memory_safe(
+                all_chunks,
+                model,
+                tokenizer,
+                ip,
+                src_lang,
+                tgt_lang,
+                batch_size=batch_size,
+                glossary_dict=glossary_dict,
+            )
+
+            for p_idx, start_idx, end_idx in para_mapping:
+                translated_text = " ".join(translated_chunks[start_idx:end_idx])
+                paragraph = doc.paragraphs[p_idx]
                 for run in paragraph.runs:
                     run.text = ""
                 if paragraph.runs:
-                    paragraph.runs[0].text = translated_paras[i]
+                    paragraph.runs[0].text = translated_text
                 else:
-                    paragraph.add_run(translated_paras[i])
+                    paragraph.add_run(translated_text)
 
         for table in doc.tables:
             for row in table.rows:
                 for cell in row.cells:
                     if cell.text.strip():
-                        translated_cell = self.translate_batch_memory_safe(
-                            [cell.text],
-                            model,
-                            tokenizer,
-                            ip,
-                            src_lang,
-                            tgt_lang,
-                            batch_size=1,
-                            glossary_dict=glossary_dict,
-                        )[0]
-                        cell.text = ""
-                        for paragraph in cell.paragraphs:
-                            if paragraph.text == "":
-                                paragraph.add_run(translated_cell)
+                        cell_chunks = chunk_for_indictrans(cell.text, tokenizer=tokenizer, max_tokens=256)
+                        if cell_chunks:
+                            trans_chunks = self.translate_batch_memory_safe(
+                                cell_chunks,
+                                model,
+                                tokenizer,
+                                ip,
+                                src_lang,
+                                tgt_lang,
+                                batch_size=batch_size,
+                                glossary_dict=glossary_dict,
+                            )
+                            translated_cell = " ".join(trans_chunks)
+                            cell.text = ""
+                            if cell.paragraphs:
+                                cell.paragraphs[0].text = translated_cell
+                            else:
+                                cell.add_paragraph(translated_cell)
 
         return doc
 
@@ -1107,14 +1277,14 @@ def translate_document(
                         doc.save(output_path)
 
                 elif ext == ".pdf":
-                    text_list: List[str] = []
-                    with pdfplumber.open(io.BytesIO(content)) as pdf:
-                        for page in pdf.pages:
-                            page_text = page.extract_text()
-                            if page_text:
-                                text_list.append(page_text)
-                    full_text = "\n".join(text_list)
                     if is_gemma:
+                        text_list: List[str] = []
+                        with pdfplumber.open(io.BytesIO(content)) as pdf:
+                            for page in pdf.pages:
+                                page_text = page.extract_text()
+                                if page_text:
+                                    text_list.append(page_text)
+                        full_text = "\n".join(text_list)
                         translated_block = _proxy_gemma_translation(
                             full_text,
                             src_name,
@@ -1123,26 +1293,41 @@ def translate_document(
                             batch_size=batch_size,
                         )
                         translated = translated_block.split("\n")
+                        doc = Document()
+                        for line in translated:
+                            doc.add_paragraph(line)
+                        doc.save(output_path)
                     else:
-                        translated = service.translate_batch_memory_safe(
-                            full_text.split("\n"),
-                            model,
-                            tokenizer,
-                            ip,
-                            src_name,
-                            tgt_name,
-                            batch_size=batch_size,
-                            glossary_dict=glossary_dict,
-                        )
-                    doc = Document()
-                    for line in translated:
-                        doc.add_paragraph(line)
-                    doc.save(output_path)
+                        doc = Document()
+                        with pdfplumber.open(io.BytesIO(content)) as pdf:
+                            for page_idx, page in enumerate(pdf.pages):
+                                page_text = page.extract_text()
+                                if not page_text or not page_text.strip():
+                                    continue
+                                if page_idx > 0 and len(doc.paragraphs) > 0:
+                                    doc.add_page_break()
+                                page_chunks = chunk_for_indictrans(page_text, tokenizer=tokenizer, max_tokens=256)
+                                if page_chunks:
+                                    translated_chunks = service.translate_batch_memory_safe(
+                                        page_chunks,
+                                        model,
+                                        tokenizer,
+                                        ip,
+                                        src_name,
+                                        tgt_name,
+                                        batch_size=batch_size,
+                                        glossary_dict=glossary_dict,
+                                    )
+                                    for chunk_text in translated_chunks:
+                                        if chunk_text.strip():
+                                            doc.add_paragraph(chunk_text)
+                        doc.save(output_path)
 
                 else:  # .txt
                     with open(input_path, "r", encoding="utf-8") as handle:
-                        lines = [line.strip() for line in handle.readlines() if line.strip()]
+                        full_text = handle.read()
                     if is_gemma:
+                        lines = [line.strip() for line in full_text.split("\n") if line.strip()]
                         translated_block = _proxy_gemma_translation(
                             "\n".join(lines),
                             src_name,
@@ -1151,21 +1336,28 @@ def translate_document(
                             batch_size=batch_size,
                         )
                         translated = translated_block.split("\n")
+                        doc = Document()
+                        for line in translated:
+                            doc.add_paragraph(line)
+                        doc.save(output_path)
                     else:
-                        translated = service.translate_batch_memory_safe(
-                            lines,
-                            model,
-                            tokenizer,
-                            ip,
-                            src_name,
-                            tgt_name,
-                            batch_size=batch_size,
-                            glossary_dict=glossary_dict,
-                        )
-                    doc = Document()
-                    for line in translated:
-                        doc.add_paragraph(line)
-                    doc.save(output_path)
+                        chunks = chunk_for_indictrans(full_text, tokenizer=tokenizer, max_tokens=256)
+                        doc = Document()
+                        if chunks:
+                            translated_chunks = service.translate_batch_memory_safe(
+                                chunks,
+                                model,
+                                tokenizer,
+                                ip,
+                                src_name,
+                                tgt_name,
+                                batch_size=batch_size,
+                                glossary_dict=glossary_dict,
+                            )
+                            for chunk_text in translated_chunks:
+                                if chunk_text.strip():
+                                    doc.add_paragraph(chunk_text)
+                        doc.save(output_path)
 
                 final_name = os.path.splitext(file.filename or "document")[0] + f"_translated_{target_language}.docx"
                 persisted_path = os.path.join(os.getcwd(), final_name)

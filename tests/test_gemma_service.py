@@ -37,6 +37,9 @@ def test_gemma_service_translate_mocked(monkeypatch):
         def batch_decode(self, tokens, skip_special_tokens=True):
             return ["வணக்கம் உலகம்"] * len(tokens)
 
+        def decode(self, token_ids, skip_special_tokens=True):
+            return "வணக்கம் உலகம்"
+
     class DummyModel:
         def __init__(self):
             import torch
