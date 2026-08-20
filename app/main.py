@@ -90,6 +90,29 @@ def _safe_init_weights(self, *args, **kwargs):
 
 transformers.modeling_utils.PreTrainedModel.init_weights = _safe_init_weights
 
+# Backward compatibility shim for legacy Seq2Seq models indexing past_key_values / EncoderDecoderCache
+import transformers.cache_utils
+
+if hasattr(transformers.cache_utils, "DynamicCache"):
+    def _dynamic_cache_getitem(self, layer_idx):
+        if hasattr(self, "layers") and layer_idx < len(self.layers):
+            layer = self.layers[layer_idx]
+            return (getattr(layer, "keys", None), getattr(layer, "values", None))
+        raise IndexError(f"DynamicCache index {layer_idx} out of range")
+    transformers.cache_utils.DynamicCache.__getitem__ = _dynamic_cache_getitem
+    transformers.cache_utils.DynamicCache.__len__ = lambda self: len(self.layers) if hasattr(self, "layers") else 0
+
+if hasattr(transformers.cache_utils, "EncoderDecoderCache"):
+    def _enc_dec_cache_getitem(self, layer_idx):
+        self_kv = self.self_attention_cache[layer_idx] if hasattr(self, "self_attention_cache") and layer_idx < len(self.self_attention_cache) else (None, None)
+        cross_kv = self.cross_attention_cache[layer_idx] if hasattr(self, "cross_attention_cache") and layer_idx < len(self.cross_attention_cache) else (None, None)
+        return (self_kv[0], self_kv[1], cross_kv[0], cross_kv[1])
+    transformers.cache_utils.EncoderDecoderCache.__getitem__ = _enc_dec_cache_getitem
+    transformers.cache_utils.EncoderDecoderCache.__len__ = lambda self: max(
+        len(self.self_attention_cache) if hasattr(self, "self_attention_cache") else 0,
+        len(self.cross_attention_cache) if hasattr(self, "cross_attention_cache") else 0
+    )
+
 from app.glossary import GlossaryService, pre_translate_replace, post_translate_replace
 from app.api_key import verify_api_key_dependency
 
@@ -633,14 +656,23 @@ class TranslationService:
                                 inputs = inputs.to(model_device)
 
                             with torch.no_grad():
-                                generated_tokens = model.generate(
-                                    **inputs,
-                                    use_cache=True,
-                                    min_length=0,
-                                    max_length=512,
-                                    num_beams=4,
-                                    early_stopping=True,
-                                )
+                                try:
+                                    generated_tokens = model.generate(
+                                        **inputs,
+                                        use_cache=False,
+                                        min_length=0,
+                                        max_length=512,
+                                        num_beams=4,
+                                        early_stopping=True,
+                                    )
+                                except Exception:
+                                    generated_tokens = model.generate(
+                                        **inputs,
+                                        min_length=0,
+                                        max_length=512,
+                                        num_beams=4,
+                                        early_stopping=True,
+                                    )
 
                             translations = tokenizer.batch_decode(
                                 generated_tokens.detach().cpu().tolist(),
