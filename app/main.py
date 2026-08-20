@@ -32,7 +32,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile, BackgroundTa
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoModelForSeq2SeqLM, AutoTokenizer
 from app.glossary import GlossaryService, pre_translate_replace, post_translate_replace
 from app.api_key import verify_api_key_dependency
 
@@ -98,32 +98,59 @@ def resolve_language(lang_input: str) -> Optional[Tuple[str, str, str]]:
 MODEL_EN_INDIC = "ai4bharat/indictrans2-en-indic-1B"
 MODEL_INDIC_EN = "ai4bharat/indictrans2-indic-en-1B"
 MODEL_INDIC_INDIC = "ai4bharat/indictrans2-indic-indic-1B"
+MODEL_GEMMA_4_12B = "google/gemma-4-12b-it"
 
 MODEL_CATALOG: Dict[str, Dict[str, object]] = {
     MODEL_EN_INDIC: {
         "key": "en-indic",
-        "description": "English to Indic translation model",
+        "description": "English to Indic translation model (IndicTrans2)",
         "source_languages": ["English"],
         "target_languages": [lang for lang in LANGUAGES.keys() if lang != "English"],
     },
     MODEL_INDIC_EN: {
         "key": "indic-en",
-        "description": "Indic to English translation model",
+        "description": "Indic to English translation model (IndicTrans2)",
         "source_languages": [lang for lang in LANGUAGES.keys() if lang != "English"],
         "target_languages": ["English"],
     },
     MODEL_INDIC_INDIC: {
         "key": "indic-indic",
-        "description": "Indic to Indic translation model",
+        "description": "Indic to Indic translation model (IndicTrans2)",
         "source_languages": [lang for lang in LANGUAGES.keys() if lang != "English"],
         "target_languages": [lang for lang in LANGUAGES.keys() if lang != "English"],
     },
+    MODEL_GEMMA_4_12B: {
+        "key": "gemma-4-12b-it",
+        "description": "Google Gemma 4 12B instruction-tuned multilingual translation model",
+        "source_languages": list(LANGUAGES.keys()),
+        "target_languages": list(LANGUAGES.keys()),
+    },
+}
+
+MODEL_ALIASES: Dict[str, str] = {
+    "google/gemma-4-12b-it": MODEL_GEMMA_4_12B,
+    "google/gemma-4-12b": MODEL_GEMMA_4_12B,
+    "google/gemma-4-12b-pt": MODEL_GEMMA_4_12B,
+    "google/gemma-4-12B-it": MODEL_GEMMA_4_12B,
+    "google/gemma-4-12B": MODEL_GEMMA_4_12B,
+    "gemma-4-12b-it": MODEL_GEMMA_4_12B,
+    "gemma-4-12b": MODEL_GEMMA_4_12B,
+    "gemma-4-12B-it": MODEL_GEMMA_4_12B,
+    "gemma-4-12B": MODEL_GEMMA_4_12B,
+    "gemma4-12b": MODEL_GEMMA_4_12B,
+    "gemma 4 12b": MODEL_GEMMA_4_12B,
+    "gemma4 12b": MODEL_GEMMA_4_12B,
+    "gemma4-12b-it": MODEL_GEMMA_4_12B,
+    "indictrans2-en-indic": MODEL_EN_INDIC,
+    "indictrans2-indic-en": MODEL_INDIC_EN,
+    "indictrans2-indic-indic": MODEL_INDIC_INDIC,
 }
 
 ModelName = Literal[
     "ai4bharat/indictrans2-en-indic-1B",
     "ai4bharat/indictrans2-indic-en-1B",
     "ai4bharat/indictrans2-indic-indic-1B",
+    "google/gemma-4-12b-it",
 ]
 
 def auto_select_model(src_name: str, tgt_name: str) -> str:
@@ -143,6 +170,8 @@ def get_engine_identifier(model_name: str) -> str:
     name_lower = model_name.lower()
     if "indictrans2" in name_lower or "indictrans" in name_lower:
         return "indictrans2"
+    elif "gemma" in name_lower:
+        return "gemma"
     elif "nayan" in name_lower:
         return "nayan_sa-en"
     elif "google" in name_lower:
@@ -224,20 +253,28 @@ class TranslationService:
             return self._inference_locks[model_id]
 
     def _resolve_model(self, model_name: str, src_lang_name: str, tgt_lang_name: str) -> Tuple[str, str]:
-        if model_name not in MODEL_CATALOG:
+        cleaned_name = model_name.strip()
+        resolved_name = MODEL_ALIASES.get(cleaned_name.lower(), cleaned_name)
+        if resolved_name not in MODEL_CATALOG:
+            for cat_name in MODEL_CATALOG:
+                if cat_name.lower() == cleaned_name.lower():
+                    resolved_name = cat_name
+                    break
+
+        if resolved_name not in MODEL_CATALOG:
             raise HTTPException(status_code=400, detail="Invalid model_name. Use one of the models returned by /models.")
 
-        model_meta = MODEL_CATALOG[model_name]
+        model_meta = MODEL_CATALOG[resolved_name]
         if src_lang_name not in model_meta["source_languages"]:
-            raise HTTPException(status_code=400, detail=f"Model {model_name} does not support source language {src_lang_name}.")
+            raise HTTPException(status_code=400, detail=f"Model {resolved_name} does not support source language {src_lang_name}.")
         if tgt_lang_name not in model_meta["target_languages"]:
-            raise HTTPException(status_code=400, detail=f"Model {model_name} does not support target language {tgt_lang_name}.")
+            raise HTTPException(status_code=400, detail=f"Model {resolved_name} does not support target language {tgt_lang_name}.")
 
-        return model_meta["key"], model_name
+        return model_meta["key"], resolved_name
 
     def get_translation_model(
         self, model_name: str, src_lang_name: str, tgt_lang_name: str, gpu_id: int
-    ) -> Tuple[AutoModelForSeq2SeqLM, AutoTokenizer, object]:
+    ) -> Tuple[object, AutoTokenizer, Optional[object]]:
         model_key, model_name = self._resolve_model(model_name, src_lang_name, tgt_lang_name)
 
         # 1. Quick check if already loaded on any device to reuse it and avoid concurrent VRAM checks
@@ -245,7 +282,7 @@ class TranslationService:
             for key, bundle in self.loaded_models.items():
                 if key[1] == model_key:
                     self.last_used[key] = time.time()
-                    return bundle["model"], bundle["tokenizer"], bundle["ip"]
+                    return bundle["model"], bundle["tokenizer"], bundle.get("ip")
 
             # 2. Select GPU under the lock if not loaded
             auto_select = os.environ.get("AUTO_SELECT_GPU", "1").lower() not in ("0", "false")
@@ -280,52 +317,115 @@ class TranslationService:
                 logger.info(f"GPU {gpu_id} not available or no CUDA GPUs detected. Falling back to CPU.")
 
             cache_key = (device, model_key)
-
-            # Import lazily so non-translation endpoints can run even if model deps are not ready.
-            from IndicTransToolkit.processor import IndicProcessor
-
             self.active_downloads.add(model_name)
             try:
                 offline_mode = os.environ.get("TRANSFORMERS_OFFLINE", "1") == "1"
 
-                ip = IndicProcessor(inference=True)
-                tokenizer = AutoTokenizer.from_pretrained(
-                    model_name,
-                    trust_remote_code=True,
-                    local_files_only=offline_mode,
-                )
+                if "indictrans" in model_name.lower():
+                    # Import lazily so non-translation endpoints can run even if model deps are not ready.
+                    from IndicTransToolkit.processor import IndicProcessor
 
-                dtype = torch.float16 if use_cuda else torch.float32
-                try:
-                    if use_cuda:
-                        torch.cuda.set_device(gpu_id)
-                    model = AutoModelForSeq2SeqLM.from_pretrained(
+                    ip = IndicProcessor(inference=True)
+                    tokenizer = AutoTokenizer.from_pretrained(
                         model_name,
                         trust_remote_code=True,
-                        torch_dtype=dtype,
                         local_files_only=offline_mode,
-                    ).to(device)
-                    model.eval()
-                except Exception as e:
-                    if use_cuda:
-                        logger.warning(f"Failed to load model on GPU: {e}. Retrying CPU fallback.")
-                        device = "cpu"
-                        use_cuda = False
-                        cache_key = (device, model_key)
-                        if cache_key in self.loaded_models:
-                            bundle = self.loaded_models[cache_key]
-                            self.last_used[cache_key] = time.time()
-                            return bundle["model"], bundle["tokenizer"], bundle["ip"]
+                    )
 
+                    dtype = torch.float16 if use_cuda else torch.float32
+                    try:
+                        if use_cuda:
+                            torch.cuda.set_device(gpu_id)
                         model = AutoModelForSeq2SeqLM.from_pretrained(
                             model_name,
                             trust_remote_code=True,
-                            torch_dtype=torch.float32,
+                            torch_dtype=dtype,
                             local_files_only=offline_mode,
                         ).to(device)
                         model.eval()
+                    except Exception as e:
+                        if use_cuda:
+                            logger.warning(f"Failed to load model on GPU: {e}. Retrying CPU fallback.")
+                            device = "cpu"
+                            use_cuda = False
+                            cache_key = (device, model_key)
+                            if cache_key in self.loaded_models:
+                                bundle = self.loaded_models[cache_key]
+                                self.last_used[cache_key] = time.time()
+                                return bundle["model"], bundle["tokenizer"], bundle["ip"]
+
+                            model = AutoModelForSeq2SeqLM.from_pretrained(
+                                model_name,
+                                trust_remote_code=True,
+                                torch_dtype=torch.float32,
+                                local_files_only=offline_mode,
+                            ).to(device)
+                            model.eval()
+                        else:
+                            raise e
+                else:
+                    # Gemma / Causal LM model loading
+                    ip = None
+                    tokenizer = AutoTokenizer.from_pretrained(
+                        model_name,
+                        trust_remote_code=True,
+                        local_files_only=offline_mode,
+                    )
+                    if tokenizer.pad_token is None:
+                        tokenizer.pad_token = tokenizer.eos_token
+                    tokenizer.padding_side = "left"
+
+                    if use_cuda:
+                        dtype = torch.bfloat16 if (hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported()) else torch.float16
                     else:
-                        raise e
+                        dtype = torch.float32
+
+                    try:
+                        if use_cuda:
+                            torch.cuda.set_device(gpu_id)
+                        try:
+                            model = AutoModelForCausalLM.from_pretrained(
+                                model_name,
+                                trust_remote_code=True,
+                                torch_dtype=dtype,
+                                local_files_only=offline_mode,
+                            ).to(device)
+                        except Exception:
+                            model = AutoModelForSeq2SeqLM.from_pretrained(
+                                model_name,
+                                trust_remote_code=True,
+                                torch_dtype=dtype,
+                                local_files_only=offline_mode,
+                            ).to(device)
+                        model.eval()
+                    except Exception as e:
+                        if use_cuda:
+                            logger.warning(f"Failed to load Gemma model on GPU: {e}. Retrying CPU fallback.")
+                            device = "cpu"
+                            use_cuda = False
+                            cache_key = (device, model_key)
+                            if cache_key in self.loaded_models:
+                                bundle = self.loaded_models[cache_key]
+                                self.last_used[cache_key] = time.time()
+                                return bundle["model"], bundle["tokenizer"], bundle.get("ip")
+
+                            try:
+                                model = AutoModelForCausalLM.from_pretrained(
+                                    model_name,
+                                    trust_remote_code=True,
+                                    torch_dtype=torch.float32,
+                                    local_files_only=offline_mode,
+                                ).to(device)
+                            except Exception:
+                                model = AutoModelForSeq2SeqLM.from_pretrained(
+                                    model_name,
+                                    trust_remote_code=True,
+                                    torch_dtype=torch.float32,
+                                    local_files_only=offline_mode,
+                                ).to(device)
+                            model.eval()
+                        else:
+                            raise e
             finally:
                 self.active_downloads.discard(model_name)
 
@@ -339,8 +439,8 @@ class TranslationService:
         if not os.path.exists(cache_dir):
             return False
         import glob
-        pattern1 = os.path.join(cache_dir, "**", "model.safetensors")
-        pattern2 = os.path.join(cache_dir, "**", "pytorch_model.bin")
+        pattern1 = os.path.join(cache_dir, "**", "*.safetensors")
+        pattern2 = os.path.join(cache_dir, "**", "*.bin")
         files = glob.glob(pattern1, recursive=True) + glob.glob(pattern2, recursive=True)
         complete_files = [f for f in files if not f.endswith(".incomplete")]
         return len(complete_files) > 0
@@ -377,11 +477,11 @@ class TranslationService:
     def translate_batch_memory_safe(
         self,
         sentences: List[str],
-        model: AutoModelForSeq2SeqLM,
+        model: object,
         tokenizer: AutoTokenizer,
-        ip: object,
-        src_lang: str,
-        tgt_lang: str,
+        ip: Optional[object] = None,
+        src_lang: str = "English",
+        tgt_lang: str = "Hindi",
         batch_size: int = 8,
         glossary_dict: Optional[Dict[str, str]] = None,
     ) -> List[str]:
@@ -402,6 +502,9 @@ class TranslationService:
         all_translations: List[str] = []
         total_sentences = len(preprocessed_sentences)
 
+        src_display = LANGUAGE_ALIASES.get(src_lang.lower(), src_lang)
+        tgt_display = LANGUAGE_ALIASES.get(tgt_lang.lower(), tgt_lang)
+
         try:
             for i in range(0, total_sentences, batch_size):
                 batch = preprocessed_sentences[i : i + batch_size]
@@ -412,32 +515,107 @@ class TranslationService:
                 if valid_sentences:
                     lock = self._get_inference_lock(model)
                     with lock:
-                        if model.device.type == "cuda":
-                            torch.cuda.set_device(model.device)
-                        
-                        preprocessed = ip.preprocess_batch(valid_sentences, src_lang=src_lang, tgt_lang=tgt_lang)
-                        inputs = tokenizer(
-                            preprocessed,
-                            truncation=True,
-                            padding="longest",
-                            return_tensors="pt",
-                        )
-                        inputs = inputs.to(model.device)
-                        with torch.no_grad():
-                            generated_tokens = model.generate(
-                                **inputs,
-                                use_cache=True,
-                                min_length=0,
-                                max_length=512,
-                                num_beams=4,
-                                early_stopping=True,
-                            )
+                        model_device = getattr(model, "device", None)
+                        if model_device is not None and getattr(model_device, "type", None) == "cuda":
+                            torch.cuda.set_device(model_device)
 
-                        translations = tokenizer.batch_decode(
-                            generated_tokens.detach().cpu().tolist(),
-                            skip_special_tokens=True,
-                        )
-                        translations = ip.postprocess_batch(translations, lang=tgt_lang)
+                        if ip is not None:
+                            # IndicTrans2 translation pipeline
+                            src_flores = LANGUAGE_INFO.get(src_display, (src_lang, None))[0]
+                            tgt_flores = LANGUAGE_INFO.get(tgt_display, (tgt_lang, None))[0]
+                            preprocessed = ip.preprocess_batch(valid_sentences, src_lang=src_flores, tgt_lang=tgt_flores)
+                            inputs = tokenizer(
+                                preprocessed,
+                                truncation=True,
+                                padding="longest",
+                                return_tensors="pt",
+                            )
+                            if model_device is not None:
+                                inputs = inputs.to(model_device)
+
+                            with torch.no_grad():
+                                generated_tokens = model.generate(
+                                    **inputs,
+                                    use_cache=True,
+                                    min_length=0,
+                                    max_length=512,
+                                    num_beams=4,
+                                    early_stopping=True,
+                                )
+
+                            translations = tokenizer.batch_decode(
+                                generated_tokens.detach().cpu().tolist(),
+                                skip_special_tokens=True,
+                            )
+                            translations = ip.postprocess_batch(translations, lang=tgt_flores)
+                        else:
+                            # Gemma instruction translation pipeline
+                            prompts = []
+                            for text_item in valid_sentences:
+                                user_msg = (
+                                    f"Translate the following text from {src_display} to {tgt_display}. "
+                                    f"Provide only the direct translation without any explanation, notes, or additional commentary:\n\n{text_item}"
+                                )
+                                if hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None):
+                                    try:
+                                        p = tokenizer.apply_chat_template(
+                                            [{"role": "user", "content": user_msg}],
+                                            tokenize=False,
+                                            add_generation_prompt=True,
+                                        )
+                                        prompts.append(p)
+                                        continue
+                                    except Exception:
+                                        pass
+                                prompts.append(f"<start_of_turn>user\n{user_msg}<end_of_turn>\n<start_of_turn>model\n")
+
+                            inputs = tokenizer(
+                                prompts,
+                                truncation=True,
+                                padding=True,
+                                return_tensors="pt",
+                            )
+                            if model_device is not None:
+                                inputs = inputs.to(model_device)
+
+                            with torch.no_grad():
+                                if getattr(getattr(model, "config", None), "is_encoder_decoder", False):
+                                    generated_tokens = model.generate(
+                                        **inputs,
+                                        max_new_tokens=512,
+                                        do_sample=False,
+                                    )
+                                    translations = tokenizer.batch_decode(
+                                        generated_tokens.detach().cpu().tolist(),
+                                        skip_special_tokens=True,
+                                    )
+                                else:
+                                    input_len = inputs.input_ids.shape[1] if hasattr(inputs, "input_ids") else 0
+                                    pad_id = getattr(tokenizer, "pad_token_id", None) or getattr(tokenizer, "eos_token_id", None)
+                                    generated_tokens = model.generate(
+                                        **inputs,
+                                        max_new_tokens=512,
+                                        do_sample=False,
+                                        pad_token_id=pad_id,
+                                    )
+                                    if input_len > 0 and generated_tokens.shape[1] >= input_len:
+                                        new_tokens = generated_tokens[:, input_len:]
+                                    else:
+                                        new_tokens = generated_tokens
+                                    translations = tokenizer.batch_decode(
+                                        new_tokens.detach().cpu().tolist(),
+                                        skip_special_tokens=True,
+                                    )
+
+                            cleaned_translations = []
+                            for trans in translations:
+                                t = trans.strip()
+                                if t.startswith("```") and t.endswith("```"):
+                                    lines_t = t.split("\n")
+                                    if len(lines_t) > 2:
+                                        t = "\n".join(lines_t[1:-1]).strip()
+                                cleaned_translations.append(t)
+                            translations = cleaned_translations
 
                     for idx, trans in zip(valid_indices, translations):
                         mapping = batch_mappings[idx]
@@ -448,14 +626,14 @@ class TranslationService:
                 all_translations.extend(batch)
         except Exception as e:
             logger.exception("Error occurred during batch translation execution:")
-            if model.device.type == "cuda" or torch.cuda.is_available():
+            if hasattr(model, "device") and getattr(model.device, "type", None) == "cuda" or torch.cuda.is_available():
                 try:
                     torch.cuda.empty_cache()
                 except Exception:
                     pass
             raise e
         finally:
-            if model.device.type == "cuda":
+            if hasattr(model, "device") and getattr(model.device, "type", None) == "cuda":
                 try:
                     torch.cuda.empty_cache()
                 except Exception:
@@ -466,9 +644,9 @@ class TranslationService:
     def process_docx(
         self,
         file_path: str,
-        model: AutoModelForSeq2SeqLM,
+        model: object,
         tokenizer: AutoTokenizer,
-        ip: object,
+        ip: Optional[object],
         src_lang: str,
         tgt_lang: str,
         batch_size: int,
@@ -664,7 +842,13 @@ def translate_text(payload: TranslateTextRequest) -> TranslateTextResponse:
     tgt_name, tgt_flores, tgt_iso = tgt_info
 
     if payload.model_name:
-        model_name = payload.model_name
+        cleaned_m = payload.model_name.strip()
+        model_name = MODEL_ALIASES.get(cleaned_m.lower(), cleaned_m)
+        if model_name not in MODEL_CATALOG:
+            for cat_name in MODEL_CATALOG:
+                if cat_name.lower() == cleaned_m.lower():
+                    model_name = cat_name
+                    break
     else:
         model_name = auto_select_model(src_name, tgt_name)
 
@@ -785,15 +969,26 @@ def translate_document(
         f"source_lang={source_language}, target_lang={target_language}, "
         f"model_name={model_name}"
     )
-    src_lang = LANGUAGES.get(source_language)
-    tgt_lang = LANGUAGES.get(target_language)
+    src_info = resolve_language(source_language)
+    tgt_info = resolve_language(target_language)
 
-    if not src_lang or not tgt_lang:
+    if not src_info or not tgt_info:
         raise HTTPException(status_code=400, detail="Invalid source or target language.")
+
+    src_name, src_flores, src_iso = src_info
+    tgt_name, tgt_flores, tgt_iso = tgt_info
+
+    cleaned_m = model_name.strip()
+    model_name = MODEL_ALIASES.get(cleaned_m.lower(), cleaned_m)
+    if model_name not in MODEL_CATALOG:
+        for cat_name in MODEL_CATALOG:
+            if cat_name.lower() == cleaned_m.lower():
+                model_name = cat_name
+                break
 
     with translation_semaphore:
         try:
-            model, tokenizer, ip = service.get_translation_model(model_name, source_language, target_language, gpu_id)
+            model, tokenizer, ip = service.get_translation_model(model_name, src_name, tgt_name, gpu_id)
         except HTTPException as he:
             raise he
         except Exception as e:
@@ -813,8 +1008,8 @@ def translate_document(
         if glossary:
             glossary_dict = glossary_service.get_merged_glossary_dict(
                 glossary,
-                source_language,
-                target_language
+                src_name,
+                tgt_name
             )
 
         ext = os.path.splitext(file.filename or "")[1].lower()
@@ -831,7 +1026,7 @@ def translate_document(
                     handle.write(content)
 
                 if ext == ".docx":
-                    doc = service.process_docx(input_path, model, tokenizer, ip, src_lang, tgt_lang, batch_size, glossary_dict)
+                    doc = service.process_docx(input_path, model, tokenizer, ip, src_name, tgt_name, batch_size, glossary_dict)
                     doc.save(output_path)
 
                 elif ext == ".pdf":
@@ -847,8 +1042,8 @@ def translate_document(
                         model,
                         tokenizer,
                         ip,
-                        src_lang,
-                        tgt_lang,
+                        src_name,
+                        tgt_name,
                         batch_size=batch_size,
                         glossary_dict=glossary_dict,
                     )
@@ -865,8 +1060,8 @@ def translate_document(
                         model,
                         tokenizer,
                         ip,
-                        src_lang,
-                        tgt_lang,
+                        src_name,
+                        tgt_name,
                         batch_size=batch_size,
                         glossary_dict=glossary_dict,
                     )

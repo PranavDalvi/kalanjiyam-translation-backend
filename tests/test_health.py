@@ -29,6 +29,11 @@ def test_models_endpoint() -> None:
     assert any(model["model_name"] == "ai4bharat/indictrans2-en-indic-1B" for model in body)
     assert any(model["model_name"] == "ai4bharat/indictrans2-indic-en-1B" for model in body)
     assert any(model["model_name"] == "ai4bharat/indictrans2-indic-indic-1B" for model in body)
+    assert any(model["model_name"] == "google/gemma-4-12b-it" for model in body)
+    gemma_entry = next(m for m in body if m["model_name"] == "google/gemma-4-12b-it")
+    assert gemma_entry["key"] == "gemma-4-12b-it"
+    assert "English" in gemma_entry["source_languages"]
+    assert "Hindi" in gemma_entry["target_languages"]
 
 
 def test_translate_text_endpoint_with_mocked_service(monkeypatch) -> None:
@@ -153,4 +158,131 @@ def test_translate_error_payload_format() -> None:
     assert "Unsupported language pair" in body["detail"]
     assert "Sanskrit (sa)" in body["detail"]
     assert "French (fr)" in body["detail"]
+
+
+def test_translate_text_endpoint_gemma_4_12b(monkeypatch) -> None:
+    def fake_get_translation_model(model_name: str, src_lang_name: str, tgt_lang_name: str, gpu_id: int):
+        assert model_name == "google/gemma-4-12b-it"
+        assert src_lang_name == "English"
+        assert tgt_lang_name == "Tamil"
+        return object(), object(), None
+
+    def fake_translate_batch_memory_safe(
+        sentences,
+        model,
+        tokenizer,
+        ip,
+        src_lang,
+        tgt_lang,
+        batch_size,
+        **kwargs
+    ):
+        assert ip is None
+        assert src_lang in ("English", "eng_Latn")
+        assert tgt_lang in ("Tamil", "tam_Taml")
+        return ["வணக்கம் உலகம்"]
+
+    monkeypatch.setattr(main.service, "get_translation_model", fake_get_translation_model)
+    monkeypatch.setattr(main.service, "translate_batch_memory_safe", fake_translate_batch_memory_safe)
+
+    response = client.post(
+        "/translate/text",
+        json={
+            "text": "Hello world",
+            "model_name": "google/gemma-4-12b-it",
+            "source_language": "English",
+            "target_language": "Tamil",
+            "gpu_id": 0,
+            "batch_size": 8,
+        },
+    )
+
+    assert response.status_code == 200
+    res_data = response.json()
+    assert res_data["status"] == "success"
+    assert res_data["engine"] == "gemma"
+    assert res_data["model"]["name"] == "google/gemma-4-12b-it"
+    assert res_data["source_language"] == "en"
+    assert res_data["target_language"] == "ta"
+    assert res_data["translated_text"] == "வணக்கம் உலகம்"
+
+
+def test_gemma_model_alias_resolution(monkeypatch) -> None:
+    resolved_models = []
+
+    def fake_get_translation_model(model_name: str, src_lang_name: str, tgt_lang_name: str, gpu_id: int):
+        resolved_models.append(model_name)
+        return object(), object(), None
+
+    def fake_translate_batch_memory_safe(sentences, model, tokenizer, ip, src_lang, tgt_lang, batch_size, **kwargs):
+        return ["மொழிபெயர்ப்பு"]
+
+    monkeypatch.setattr(main.service, "get_translation_model", fake_get_translation_model)
+    monkeypatch.setattr(main.service, "translate_batch_memory_safe", fake_translate_batch_memory_safe)
+
+    for alias in ["gemma-4-12b", "gemma 4 12b", "google/gemma-4-12B-it", "gemma4-12b-it"]:
+        response = client.post(
+            "/translate/text",
+            json={
+                "text": "Testing alias",
+                "model_name": alias,
+                "source_language": "English",
+                "target_language": "Tamil",
+            },
+        )
+        assert response.status_code == 200
+        assert response.json()["engine"] == "gemma"
+
+    assert all(m == "google/gemma-4-12b-it" for m in resolved_models)
+
+
+def test_translate_batch_memory_safe_gemma_logic() -> None:
+    import torch
+
+    class DummyBatch(dict):
+        def __init__(self, input_ids):
+            super().__init__({"input_ids": input_ids})
+            self.input_ids = input_ids
+        def to(self, device):
+            return self
+
+    class DummyTokenizer:
+        def __init__(self):
+            self.pad_token_id = 0
+            self.eos_token_id = 1
+            self.chat_template = None
+
+        def __call__(self, texts, truncation=True, padding=True, return_tensors="pt"):
+            # Return dummy tensor with shape [len(texts), 10]
+            return DummyBatch(torch.zeros((len(texts), 10), dtype=torch.long))
+
+        def batch_decode(self, tokens, skip_special_tokens=True):
+            return ["வணக்கம்"] * len(tokens)
+
+    class DummyModel:
+        def __init__(self):
+            self.device = torch.device("cpu")
+            self.config = type("Config", (), {"is_encoder_decoder": False})()
+
+        def generate(self, **kwargs):
+            input_ids = kwargs.get("input_ids", torch.zeros((1, 10), dtype=torch.long))
+            # Append 5 new tokens
+            return torch.cat([input_ids, torch.ones((input_ids.shape[0], 5), dtype=torch.long)], dim=1)
+
+    dummy_model = DummyModel()
+    dummy_tokenizer = DummyTokenizer()
+
+    results = main.service.translate_batch_memory_safe(
+        sentences=["Hello world"],
+        model=dummy_model,
+        tokenizer=dummy_tokenizer,
+        ip=None,
+        src_lang="English",
+        tgt_lang="Tamil",
+        batch_size=8,
+    )
+
+    assert results == ["வணக்கம்"]
+
+
 

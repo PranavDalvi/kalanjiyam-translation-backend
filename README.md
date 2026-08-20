@@ -166,12 +166,45 @@ Example response:
   {
     "model_name": "ai4bharat/indictrans2-en-indic-1B",
     "key": "en-indic",
-    "description": "English to Indic translation model",
+    "description": "English to Indic translation model (IndicTrans2)",
     "source_languages": ["English"],
-    "target_languages": ["Hindi", "Bengali", "Tamil"]
+    "target_languages": ["Hindi", "Bengali", "Tamil", "..."],
+    "status": "cached"
+  },
+  {
+    "model_name": "ai4bharat/indictrans2-indic-en-1B",
+    "key": "indic-en",
+    "description": "Indic to English translation model (IndicTrans2)",
+    "source_languages": ["Hindi", "Bengali", "Tamil", "..."],
+    "target_languages": ["English"],
+    "status": "cached"
+  },
+  {
+    "model_name": "ai4bharat/indictrans2-indic-indic-1B",
+    "key": "indic-indic",
+    "description": "Indic to Indic translation model (IndicTrans2)",
+    "source_languages": ["Hindi", "Bengali", "Tamil", "..."],
+    "target_languages": ["Hindi", "Bengali", "Tamil", "..."],
+    "status": "cached"
+  },
+  {
+    "model_name": "google/gemma-4-12b-it",
+    "key": "gemma-4-12b-it",
+    "description": "Google Gemma 4 12B instruction-tuned multilingual translation model",
+    "source_languages": ["English", "Hindi", "Bengali", "Tamil", "Marathi", "..."],
+    "target_languages": ["English", "Hindi", "Bengali", "Tamil", "Marathi", "..."],
+    "status": "cached"
   }
 ]
 ```
+
+### Model Aliases
+You can request Gemma 4 12B using any of its standard names:
+- `"google/gemma-4-12b-it"` (canonical)
+- `"google/gemma-4-12B-it"`
+- `"gemma-4-12b"`
+- `"gemma 4 12b"`
+- `"gemma4-12b-it"`
 
 ## API Endpoints: Inputs and Expected Outputs
 
@@ -340,7 +373,7 @@ Health check:
 curl -sS http://127.0.0.1:8000/health
 ```
 
-Translate text:
+Translate text (IndicTrans2):
 
 ```bash
 curl -sS -X POST "http://127.0.0.1:8000/translate/text" \
@@ -350,6 +383,21 @@ curl -sS -X POST "http://127.0.0.1:8000/translate/text" \
     "model_name": "ai4bharat/indictrans2-en-indic-1B",
     "source_language": "English",
     "target_language": "Hindi",
+    "gpu_id": 0,
+    "batch_size": 8
+  }'
+```
+
+Translate text (Gemma 4 12B):
+
+```bash
+curl -sS -X POST "http://127.0.0.1:8000/translate/text" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "The project is progressing smoothly according to our planned milestones.",
+    "model_name": "google/gemma-4-12b-it",
+    "source_language": "English",
+    "target_language": "Tamil",
     "gpu_id": 0,
     "batch_size": 8
   }'
