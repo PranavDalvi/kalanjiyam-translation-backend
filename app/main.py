@@ -328,6 +328,12 @@ class TranslationService:
             self.active_downloads.add(model_name)
             try:
                 offline_mode = os.environ.get("TRANSFORMERS_OFFLINE", "1") == "1"
+                hf_token = os.environ.get("HF_TOKEN")
+                if hf_token:
+                    hf_token = hf_token.strip().strip("'\"\\")
+                    if hf_token.startswith("token="):
+                        hf_token = hf_token[6:]
+                hf_token = hf_token or None
 
                 if "indictrans" in model_name.lower():
                     # Import lazily so non-translation endpoints can run even if model deps are not ready.
@@ -338,6 +344,7 @@ class TranslationService:
                         model_name,
                         trust_remote_code=True,
                         local_files_only=offline_mode,
+                        token=hf_token,
                     )
 
                     dtype = torch.float16 if use_cuda else torch.float32
@@ -349,6 +356,7 @@ class TranslationService:
                             trust_remote_code=True,
                             torch_dtype=dtype,
                             local_files_only=offline_mode,
+                            token=hf_token,
                         ).to(device)
                         model.eval()
                     except Exception as e:
@@ -367,6 +375,7 @@ class TranslationService:
                                 trust_remote_code=True,
                                 torch_dtype=torch.float32,
                                 local_files_only=offline_mode,
+                                token=hf_token,
                             ).to(device)
                             model.eval()
                         else:
@@ -378,6 +387,7 @@ class TranslationService:
                         model_name,
                         trust_remote_code=True,
                         local_files_only=offline_mode,
+                        token=hf_token,
                     )
                     if tokenizer.pad_token is None:
                         tokenizer.pad_token = tokenizer.eos_token
@@ -391,20 +401,40 @@ class TranslationService:
                     try:
                         if use_cuda:
                             torch.cuda.set_device(gpu_id)
-                        try:
-                            model = AutoModelForCausalLM.from_pretrained(
-                                model_name,
-                                trust_remote_code=True,
-                                torch_dtype=dtype,
-                                local_files_only=offline_mode,
-                            ).to(device)
-                        except Exception:
-                            model = AutoModelForSeq2SeqLM.from_pretrained(
-                                model_name,
-                                trust_remote_code=True,
-                                torch_dtype=dtype,
-                                local_files_only=offline_mode,
-                            ).to(device)
+                            try:
+                                model = AutoModelForCausalLM.from_pretrained(
+                                    model_name,
+                                    trust_remote_code=True,
+                                    torch_dtype=dtype,
+                                    device_map={"": device},
+                                    local_files_only=offline_mode,
+                                    token=hf_token,
+                                )
+                            except Exception:
+                                model = AutoModelForCausalLM.from_pretrained(
+                                    model_name,
+                                    trust_remote_code=True,
+                                    torch_dtype=dtype,
+                                    local_files_only=offline_mode,
+                                    token=hf_token,
+                                ).to(device)
+                        else:
+                            try:
+                                model = AutoModelForCausalLM.from_pretrained(
+                                    model_name,
+                                    trust_remote_code=True,
+                                    torch_dtype=dtype,
+                                    local_files_only=offline_mode,
+                                    token=hf_token,
+                                ).to(device)
+                            except Exception:
+                                model = AutoModelForSeq2SeqLM.from_pretrained(
+                                    model_name,
+                                    trust_remote_code=True,
+                                    torch_dtype=dtype,
+                                    local_files_only=offline_mode,
+                                    token=hf_token,
+                                ).to(device)
                         model.eval()
                     except Exception as e:
                         if use_cuda:
@@ -423,6 +453,7 @@ class TranslationService:
                                     trust_remote_code=True,
                                     torch_dtype=torch.float32,
                                     local_files_only=offline_mode,
+                                    token=hf_token,
                                 ).to(device)
                             except Exception:
                                 model = AutoModelForSeq2SeqLM.from_pretrained(
@@ -430,6 +461,7 @@ class TranslationService:
                                     trust_remote_code=True,
                                     torch_dtype=torch.float32,
                                     local_files_only=offline_mode,
+                                    token=hf_token,
                                 ).to(device)
                             model.eval()
                         else:
@@ -885,6 +917,7 @@ def translate_text(payload: TranslateTextRequest) -> TranslateTextResponse:
             raise he
         except Exception as e:
             err_msg = str(e)
+            logger.exception(f"Failed to load translation model {model_name}: {err_msg}")
             if "offline" in err_msg.lower() or "local_files" in err_msg.lower() or "does not appear to have a file named" in err_msg.lower():
                 raise HTTPException(
                     status_code=503,
