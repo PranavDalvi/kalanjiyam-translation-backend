@@ -40,6 +40,16 @@ import transformers.tokenization_utils_base
 if not hasattr(transformers.tokenization_utils, "PreTrainedTokenizerBase"):
     transformers.tokenization_utils.PreTrainedTokenizerBase = transformers.tokenization_utils_base.PreTrainedTokenizerBase
 
+# Backward compatibility shim for IndicTransTokenizer setting special tokens before __init__
+_orig_tokenizer_setattr = transformers.tokenization_utils_base.PreTrainedTokenizerBase.__setattr__
+
+def _safe_tokenizer_setattr(self, name, value):
+    if "_special_tokens_map" not in self.__dict__ and not hasattr(self, "_special_tokens_map"):
+        object.__setattr__(self, "_special_tokens_map", {})
+    return _orig_tokenizer_setattr(self, name, value)
+
+transformers.tokenization_utils_base.PreTrainedTokenizerBase.__setattr__ = _safe_tokenizer_setattr
+
 # Backward compatibility shim for IndicTrans2 dynamic configuration (configuration_indictrans.py)
 if "transformers.onnx" not in sys.modules:
     onnx_mod = types.ModuleType("transformers.onnx")
