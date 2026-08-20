@@ -32,8 +32,8 @@ services:
   gemma-worker:
     build: ./gemma_service
     container_name: kalanjiyam-gemma-worker
-    ports:
-      - "8889:8889"
+    expose:
+      - "8889"
     volumes:
       - ~/.cache/huggingface:/root/.cache/huggingface
     environment:

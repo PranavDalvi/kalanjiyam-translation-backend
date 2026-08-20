@@ -150,18 +150,14 @@ if [ "$HAS_GPU" = true ]; then
         docker rm -f kalanjiyam-translation-api kalanjiyam-gemma-worker 2>/dev/null || true
         docker compose down --remove-orphans || true
         GLOSSARIES_DIR="$GLOSSARIES_DIR_VAL" HF_TOKEN="$HF_TOKEN_ENV" TRANSFORMERS_OFFLINE="$OFFLINE_MODE" HF_HUB_OFFLINE="$OFFLINE_MODE" MAX_CONCURRENT_TRANSLATIONS="$MAX_CONCURRENT_TRANSLATIONS_VAL" AUTO_SELECT_GPU="$AUTO_SELECT_GPU_VAL" ENABLE_API_KEY_AUTH="$ENABLE_API_KEY_AUTH_VAL" API_KEY_DB_PATH="api_keys.db" docker compose up -d --build
-        echo "Services are running:"
-        echo "  - Main API (IndicTrans2): http://localhost:8888"
-        echo "  - Gemma 4 Sidecar:       http://localhost:8889"
+        echo "Service is running on http://localhost:8888"
         echo "To view logs, run: docker compose logs -f"
 
     elif command -v docker-compose &> /dev/null; then
         docker rm -f kalanjiyam-translation-api kalanjiyam-gemma-worker 2>/dev/null || true
         docker-compose down --remove-orphans || true
         GLOSSARIES_DIR="$GLOSSARIES_DIR_VAL" HF_TOKEN="$HF_TOKEN_ENV" TRANSFORMERS_OFFLINE="$OFFLINE_MODE" HF_HUB_OFFLINE="$OFFLINE_MODE" MAX_CONCURRENT_TRANSLATIONS="$MAX_CONCURRENT_TRANSLATIONS_VAL" AUTO_SELECT_GPU="$AUTO_SELECT_GPU_VAL" ENABLE_API_KEY_AUTH="$ENABLE_API_KEY_AUTH_VAL" API_KEY_DB_PATH="api_keys.db" docker-compose up -d --build
-        echo "Services are running:"
-        echo "  - Main API (IndicTrans2): http://localhost:8888"
-        echo "  - Gemma 4 Sidecar:       http://localhost:8889"
+        echo "Service is running on http://localhost:8888"
         echo "To view logs, run: docker-compose logs -f"
     else
         echo "Warning: docker-compose command not found. Running with direct docker command..."
@@ -193,26 +189,38 @@ if [ "$HAS_GPU" = false ]; then
     echo "Action: Starting container in CPU-only mode..."
     echo "---------------------------------------------------------"
     
-    docker rm -f kalanjiyam-translation-api 2>/dev/null || true
-    
-    docker run -d \
-      -p 8888:8888 \
-      -v ~/.cache/huggingface:/root/.cache/huggingface \
-      -v "$GLOSSARIES_HOST_DIR:/app/glossaries" \
-      -v "$API_KEY_DB_ABS_PATH:/app/api_keys.db" \
-      -e TRANSFORMERS_OFFLINE="$OFFLINE_MODE" \
-      -e HF_HUB_OFFLINE="$OFFLINE_MODE" \
-      -e HF_TOKEN="$HF_TOKEN_ENV" \
-      -e GLOSSARIES_DIR="glossaries" \
-      -e MAX_CONCURRENT_TRANSLATIONS="$MAX_CONCURRENT_TRANSLATIONS_VAL" \
-      -e AUTO_SELECT_GPU="$AUTO_SELECT_GPU_VAL" \
-      -e ENABLE_API_KEY_AUTH="$ENABLE_API_KEY_AUTH_VAL" \
-      -e API_KEY_DB_PATH="api_keys.db" \
-      --name kalanjiyam-translation-api \
-      kalanjiyam-translation
-      
-    echo "Service is running on http://localhost:8888"
-    echo "To view logs, run: docker logs -f kalanjiyam-translation-api"
+    if docker compose version &> /dev/null; then
+        docker rm -f kalanjiyam-translation-api kalanjiyam-gemma-worker 2>/dev/null || true
+        docker compose down --remove-orphans || true
+        GLOSSARIES_DIR="$GLOSSARIES_DIR_VAL" HF_TOKEN="$HF_TOKEN_ENV" TRANSFORMERS_OFFLINE="$OFFLINE_MODE" HF_HUB_OFFLINE="$OFFLINE_MODE" MAX_CONCURRENT_TRANSLATIONS="$MAX_CONCURRENT_TRANSLATIONS_VAL" AUTO_SELECT_GPU="0" ENABLE_API_KEY_AUTH="$ENABLE_API_KEY_AUTH_VAL" API_KEY_DB_PATH="api_keys.db" docker compose up -d --build
+        echo "Service is running in CPU mode on http://localhost:8888"
+        echo "To view logs, run: docker compose logs -f"
+    elif command -v docker-compose &> /dev/null; then
+        docker rm -f kalanjiyam-translation-api kalanjiyam-gemma-worker 2>/dev/null || true
+        docker-compose down --remove-orphans || true
+        GLOSSARIES_DIR="$GLOSSARIES_DIR_VAL" HF_TOKEN="$HF_TOKEN_ENV" TRANSFORMERS_OFFLINE="$OFFLINE_MODE" HF_HUB_OFFLINE="$OFFLINE_MODE" MAX_CONCURRENT_TRANSLATIONS="$MAX_CONCURRENT_TRANSLATIONS_VAL" AUTO_SELECT_GPU="0" ENABLE_API_KEY_AUTH="$ENABLE_API_KEY_AUTH_VAL" API_KEY_DB_PATH="api_keys.db" docker-compose up -d --build
+        echo "Service is running in CPU mode on http://localhost:8888"
+        echo "To view logs, run: docker-compose logs -f"
+    else
+        docker rm -f kalanjiyam-translation-api kalanjiyam-gemma-worker 2>/dev/null || true
+        docker run -d \
+          -p 8888:8888 \
+          -v ~/.cache/huggingface:/root/.cache/huggingface \
+          -v "$GLOSSARIES_HOST_DIR:/app/glossaries" \
+          -v "$API_KEY_DB_ABS_PATH:/app/api_keys.db" \
+          -e TRANSFORMERS_OFFLINE="$OFFLINE_MODE" \
+          -e HF_HUB_OFFLINE="$OFFLINE_MODE" \
+          -e HF_TOKEN="$HF_TOKEN_ENV" \
+          -e GLOSSARIES_DIR="glossaries" \
+          -e MAX_CONCURRENT_TRANSLATIONS="$MAX_CONCURRENT_TRANSLATIONS_VAL" \
+          -e AUTO_SELECT_GPU="0" \
+          -e ENABLE_API_KEY_AUTH="$ENABLE_API_KEY_AUTH_VAL" \
+          -e API_KEY_DB_PATH="api_keys.db" \
+          --name kalanjiyam-translation-api \
+          kalanjiyam-translation
+        echo "Service is running on http://localhost:8888"
+        echo "To view logs, run: docker logs -f kalanjiyam-translation-api"
+    fi
 fi
 
 
@@ -225,7 +233,13 @@ if [ "$OFFLINE_MODE" = 0 ]; then
     echo ""
     echo "---------------------------------------------------------"
     echo "Tailing container logs to monitor model downloads."
-    echo "Press Ctrl+C to exit log viewer (the container will continue in the background)."
+    echo "Press Ctrl+C to exit log viewer (the containers will continue in the background)."
     echo "---------------------------------------------------------"
-    docker logs -f kalanjiyam-translation-api
+    if docker compose version &> /dev/null; then
+        docker compose logs -f
+    elif command -v docker-compose &> /dev/null; then
+        docker-compose logs -f
+    else
+        docker logs -f kalanjiyam-translation-api
+    fi
 fi
